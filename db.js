@@ -35,8 +35,9 @@ async function init() {
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS wins INTEGER NOT NULL DEFAULT 0;`);
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS losses INTEGER NOT NULL DEFAULT 0;`);
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER NOT NULL DEFAULT 500;`);
 
-      console.log('DB ready: users table + profile columns ok');
+      console.log('DB ready: users table + profile + coins ok');
       return;
     } catch (err) {
       console.log(`DB not ready (attempt ${attempt}/${maxTries}): ${err.code || err.message}`);

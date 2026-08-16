@@ -60,6 +60,7 @@ function publicUser(u){
     email: u.email,
     phone: u.phone,
     balance: Number(u.balance),
+    coins: Number(u.coins != null ? u.coins : 500),
     username: defaultName(u),
     wins: Number(u.wins || 0),
     losses: Number(u.losses || 0),
