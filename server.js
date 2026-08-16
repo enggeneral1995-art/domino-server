@@ -151,6 +151,6 @@ io.on('connection', socket => {
 });
 
 const PORT = process.env.PORT || 3000;
-init().catch(e => console.error('DB init failed:', e.message)).finally(() => {
+db.init().catch(e => console.error('DB init failed:', e.message)).finally(() => {
   server.listen(PORT, () => console.log('Domino server (v3) on port ' + PORT));
 });
