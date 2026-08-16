@@ -1,6 +1,6 @@
 {
   "name": "domino-block-server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Online 1v1 Domino Block backend + auth",
   "main": "server.js",
   "type": "commonjs",
@@ -10,7 +10,6 @@
     "express": "^4.19.2",
     "socket.io": "^4.7.5",
     "pg": "^8.11.5",
-    "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2"
   }
 }
