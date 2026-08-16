@@ -201,7 +201,7 @@ function startRound(room){
 }
 io.on('connection', socket => {
   socket.on('find_match', (opts={}) => {
-    const goal=[100,150,200].includes(opts.goal)?opts.goal:100;
+    const goal=[100,200,500].includes(opts.goal)?opts.goal:100;
     if (waiting && waiting.socket.connected && waiting.socket.id!==socket.id){
       const p1=waiting.socket,p2=socket; waiting=null;
       const roomId='r'+(seq++); const room={players:[p1.id,p2.id],goal};
