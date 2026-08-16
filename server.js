@@ -8,7 +8,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
-const { pool, init } = require('./db');
+const db = require('./db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret_in_railway';
 
@@ -56,11 +56,11 @@ app.post('/api/register', async (req, res) => {
     email = String(email).trim().toLowerCase();
     if (password.length < 6) return res.status(400).json({ error: 'password_too_short' });
 
-    const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
+    const exists = await db.query('SELECT id FROM users WHERE email=$1', [email]);
     if (exists.rows.length) return res.status(409).json({ error: 'email_already_used' });
 
     const hash = hashPassword(password);
-    const r = await pool.query(
+    const r = await db.query(
       'INSERT INTO users (email, phone, password_hash) VALUES ($1,$2,$3) RETURNING *',
       [email, phone || null, hash]
     );
@@ -78,7 +78,7 @@ app.post('/api/login', async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: 'email_and_password_required' });
     email = String(email).trim().toLowerCase();
 
-    const r = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
+    const r = await db.query('SELECT * FROM users WHERE email=$1', [email]);
     if (!r.rows.length) return res.status(401).json({ error: 'invalid_credentials' });
     const user = r.rows[0];
     const ok = verifyPassword(password, user.password_hash);
@@ -101,7 +101,7 @@ function auth(req, res, next){
 
 app.get('/api/me', auth, async (req, res) => {
   try {
-    const r = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    const r = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
     if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
     res.json({ user: publicUser(r.rows[0]) });
   } catch(e){ res.status(500).json({ error: 'server_error' }); }

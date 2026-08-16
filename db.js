@@ -1,14 +1,23 @@
-// db.js — PostgreSQL connection + table setup
+// db.js — PostgreSQL connection + table setup (lazy, build-safe)
 const { Pool } = require('pg');
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  // Railway's internal DATABASE_URL doesn't need SSL
-  ssl: false
-});
+let pool = null;
+function getPool() {
+  if (!pool) {
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: false
+    });
+  }
+  return pool;
+}
 
 async function init() {
-  await pool.query(`
+  if (!process.env.DATABASE_URL) {
+    console.warn('DATABASE_URL not set yet — skipping table init');
+    return;
+  }
+  await getPool().query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       email TEXT UNIQUE NOT NULL,
@@ -21,4 +30,9 @@ async function init() {
   console.log('DB ready: users table ok');
 }
 
-module.exports = { pool, init };
+// export a proxy-like object so `pool.query(...)` works via getPool()
+module.exports = {
+  init,
+  query: (...args) => getPool().query(...args),
+  get pool(){ return getPool(); }
+};
