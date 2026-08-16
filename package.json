@@ -1,18 +1,16 @@
 {
   "name": "domino-block-server",
-  "version": "0.1.0",
-  "description": "Online 1v1 Domino Block backend (Socket.io) - authoritative game server",
+  "version": "0.2.0",
+  "description": "Online 1v1 Domino Block backend + auth",
   "main": "server.js",
   "type": "commonjs",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "express": "^4.19.2",
-    "socket.io": "^4.7.5"
+    "socket.io": "^4.7.5",
+    "pg": "^8.11.5",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
   }
 }
