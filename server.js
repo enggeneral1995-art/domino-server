@@ -6,11 +6,27 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { pool, init } = require('./db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret_in_railway';
+
+// password hashing using Node's built-in crypto (no external deps)
+function hashPassword(password){
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return salt + ':' + derived;
+}
+function verifyPassword(password, stored){
+  try {
+    const [salt, key] = String(stored).split(':');
+    const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+    const a = Buffer.from(key, 'hex');
+    const b = Buffer.from(derived, 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch(e){ return false; }
+}
 
 const app = express();
 app.use(express.json());
@@ -43,7 +59,7 @@ app.post('/api/register', async (req, res) => {
     const exists = await pool.query('SELECT id FROM users WHERE email=$1', [email]);
     if (exists.rows.length) return res.status(409).json({ error: 'email_already_used' });
 
-    const hash = await bcrypt.hash(password, 10);
+    const hash = hashPassword(password);
     const r = await pool.query(
       'INSERT INTO users (email, phone, password_hash) VALUES ($1,$2,$3) RETURNING *',
       [email, phone || null, hash]
@@ -65,7 +81,7 @@ app.post('/api/login', async (req, res) => {
     const r = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
     if (!r.rows.length) return res.status(401).json({ error: 'invalid_credentials' });
     const user = r.rows[0];
-    const ok = await bcrypt.compare(password, user.password_hash);
+    const ok = verifyPassword(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
 
     res.json({ token: makeToken(user), user: publicUser(user) });
