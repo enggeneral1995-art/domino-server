@@ -4,7 +4,13 @@ const { Pool } = require('pg');
 let pool = null;
 function getPool() {
   if (!pool) {
-    pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: false });
+    var url = process.env.DATABASE_URL || '';
+    // internal Railway host needs no SSL; public proxy host does
+    var needSSL = url.indexOf('railway.internal') === -1;
+    pool = new Pool({
+      connectionString: url,
+      ssl: needSSL ? { rejectUnauthorized: false } : false
+    });
   }
   return pool;
 }
