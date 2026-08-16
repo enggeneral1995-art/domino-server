@@ -179,6 +179,36 @@ app.post('/api/profile', auth, async (req, res) => {
   }
 });
 
+/* ---------------- GAME RESULT (offline vs computer) ---------------- */
+// Awards/deducts FREE coins and updates wins/losses. Coins have no cash value.
+app.post('/api/game-result', auth, async (req, res) => {
+  try {
+    const result = (req.body && req.body.result) === 'win' ? 'win' : 'loss';
+    let entry = parseInt(req.body && req.body.entry, 10);
+    if (![100, 200, 500].includes(entry)) entry = 100;
+
+    const r = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
+    const u = r.rows[0];
+
+    let coins = Number(u.coins || 0);
+    let wins = Number(u.wins || 0);
+    let losses = Number(u.losses || 0);
+
+    if (result === 'win') { coins += entry; wins += 1; }          // winner takes the pot (no fee)
+    else { coins = Math.max(0, coins - entry); losses += 1; }
+
+    const up = await db.query(
+      'UPDATE users SET coins=$1, wins=$2, losses=$3 WHERE id=$4 RETURNING *',
+      [coins, wins, losses, req.user.id]
+    );
+    res.json({ user: publicUser(up.rows[0]) });
+  } catch (e) {
+    console.error('game-result error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 /* ---------------- GAME (lockstep relay) ---------------- */
 const TILE_VALUES = [[0,0],[1,2],[2,3],[2,4],[1,5],[5,5],[3,6],[0,1],[2,2],[3,3],
   [3,4],[2,5],[0,6],[4,6],[1,1],[0,3],[0,4],[4,4],[3,5],[1,6],
