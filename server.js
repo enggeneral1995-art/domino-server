@@ -1,6 +1,7 @@
 /*
- * server.js — Domino Block online server (v3)
+ * server.js — Domino Block online server (v4)
  * - Auth API (register / login / me) backed by PostgreSQL
+ * - Profile API (get / update: username, avatar, wins, losses)
  * - Online 1v1 game via lockstep relay (matchmaking + shared deck + move relay)
  */
 const express = require('express');
@@ -43,11 +44,28 @@ app.use((req, res, next) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
-app.get('/', (_req, res) => res.send('Domino Block server is running (v3 auth + game)'));
+app.get('/', (_req, res) => res.send('Domino Block server is running (v4 auth + profile + game)'));
 
 /* ---------------- AUTH ---------------- */
 function makeToken(user){ return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' }); }
-function publicUser(u){ return { id: u.id, email: u.email, phone: u.phone, balance: Number(u.balance) }; }
+
+// default username from the email (before the @), used only if none set yet
+function defaultName(u){
+  if (u.username) return u.username;
+  return String(u.email || 'player').split('@')[0];
+}
+function publicUser(u){
+  return {
+    id: u.id,
+    email: u.email,
+    phone: u.phone,
+    balance: Number(u.balance),
+    username: defaultName(u),
+    wins: Number(u.wins || 0),
+    losses: Number(u.losses || 0),
+    avatar: u.avatar || null
+  };
+}
 
 app.post('/api/register', async (req, res) => {
   try {
@@ -107,6 +125,59 @@ app.get('/api/me', auth, async (req, res) => {
   } catch(e){ res.status(500).json({ error: 'server_error' }); }
 });
 
+/* ---------------- PROFILE ---------------- */
+
+// get my full profile
+app.get('/api/profile', auth, async (req, res) => {
+  try {
+    const r = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
+    res.json({ user: publicUser(r.rows[0]) });
+  } catch(e){
+    console.error('profile get error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// update username and/or avatar
+app.post('/api/profile', auth, async (req, res) => {
+  try {
+    let { username, avatar } = req.body || {};
+
+    // validate username (optional)
+    if (username !== undefined && username !== null) {
+      username = String(username).trim();
+      if (username.length < 2 || username.length > 20) {
+        return res.status(400).json({ error: 'username_length' });
+      }
+    }
+    // validate avatar (optional): accept a short id/name like "a1".."a12" or a small string
+    if (avatar !== undefined && avatar !== null) {
+      avatar = String(avatar).trim();
+      if (avatar.length > 40) return res.status(400).json({ error: 'avatar_invalid' });
+    }
+
+    // build a dynamic update only for the fields provided
+    const sets = [];
+    const vals = [];
+    let i = 1;
+    if (username !== undefined && username !== null) { sets.push(`username=$${i++}`); vals.push(username); }
+    if (avatar !== undefined && avatar !== null)     { sets.push(`avatar=$${i++}`);   vals.push(avatar); }
+
+    if (!sets.length) return res.status(400).json({ error: 'nothing_to_update' });
+
+    vals.push(req.user.id);
+    const r = await db.query(
+      `UPDATE users SET ${sets.join(', ')} WHERE id=$${i} RETURNING *`,
+      vals
+    );
+    res.json({ user: publicUser(r.rows[0]) });
+  } catch(e){
+    console.error('profile update error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 /* ---------------- GAME (lockstep relay) ---------------- */
 const TILE_VALUES = [[0,0],[1,2],[2,3],[2,4],[1,5],[5,5],[3,6],[0,1],[2,2],[3,3],
   [3,4],[2,5],[0,6],[4,6],[1,1],[0,3],[0,4],[4,4],[3,5],[1,6],
@@ -152,5 +223,5 @@ io.on('connection', socket => {
 
 const PORT = process.env.PORT || 3000;
 db.init().catch(e => console.error('DB init failed:', e.message)).finally(() => {
-  server.listen(PORT, () => console.log('Domino server (v3) on port ' + PORT));
+  server.listen(PORT, () => console.log('Domino server (v4) on port ' + PORT));
 });
