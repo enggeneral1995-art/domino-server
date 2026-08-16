@@ -1,11 +1,20 @@
-// db.js — PostgreSQL connection + table setup (Railway-ready, with retry)
+// db.js — PostgreSQL connection + table setup (Railway-ready, with diagnostics)
 const { Pool } = require('pg');
 
 const connectionString = process.env.DATABASE_URL;
 
-// Railway's internal host (postgres.railway.internal) does NOT use SSL.
-// The public host (rlwy.net / proxy) DOES need SSL.
-// We detect automatically so it works either way.
+// --- Diagnostics: show WHERE we are trying to connect (password hidden) ---
+try {
+  if (!connectionString) {
+    console.log('DIAG: DATABASE_URL is EMPTY -> pg will try localhost:5432');
+  } else {
+    const u = new URL(connectionString);
+    console.log(`DIAG: connecting to host=${u.hostname} port=${u.port} db=${u.pathname.replace('/', '')} ssl=${u.hostname.includes('railway.internal') ? 'off' : 'on'}`);
+  }
+} catch (e) {
+  console.log('DIAG: could not parse DATABASE_URL:', e.message);
+}
+
 const isInternal =
   !connectionString || connectionString.includes('railway.internal');
 
@@ -14,14 +23,13 @@ const pool = new Pool({
   ssl: isInternal ? false : { rejectUnauthorized: false },
 });
 
-// Wait until the database is actually reachable, then create the table.
 async function init() {
   const maxTries = 10;
   const delayMs = 3000;
 
   for (let attempt = 1; attempt <= maxTries; attempt++) {
     try {
-      await pool.query('SELECT 1'); // test the connection first
+      await pool.query('SELECT 1');
       await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
           id SERIAL PRIMARY KEY,
@@ -33,10 +41,11 @@ async function init() {
         );
       `);
       console.log('DB ready: users table ok');
-      return; // success — stop retrying
+      return;
     } catch (err) {
+      // Print the FULL error target so we can see exactly what's refused
       console.log(
-        `DB not ready (attempt ${attempt}/${maxTries}): ${err.code || err.message}. Retrying in ${delayMs / 1000}s...`
+        `DB not ready (attempt ${attempt}/${maxTries}): code=${err.code} address=${err.address || '?'} port=${err.port || '?'} msg=${err.message}`
       );
       if (attempt === maxTries) {
         console.error('DB connection failed after all retries.');
@@ -47,7 +56,6 @@ async function init() {
   }
 }
 
-// Convenience query() so server.js can call db.query(...) OR db.pool.query(...)
 function query(text, params) {
   return pool.query(text, params);
 }
