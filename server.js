@@ -67,7 +67,7 @@ app.post('/api/register', async (req, res) => {
     const user = r.rows[0];
     res.json({ token: makeToken(user), user: publicUser(user) });
   } catch (e) {
-    console.error('register error', e.message);
+    console.error('register error:', e.message, e.code||'');
     res.status(500).json({ error: 'server_error' });
   }
 });
@@ -86,7 +86,7 @@ app.post('/api/login', async (req, res) => {
 
     res.json({ token: makeToken(user), user: publicUser(user) });
   } catch (e) {
-    console.error('login error', e.message);
+    console.error('login error:', e.message, e.code||'');
     res.status(500).json({ error: 'server_error' });
   }
 });
