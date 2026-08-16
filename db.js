@@ -15,8 +15,6 @@ const pool = new Pool({
 });
 
 // Wait until the database is actually reachable, then create the table.
-// On Railway the private network can take a few seconds to be ready at boot,
-// which is the usual cause of ECONNREFUSED. We retry a few times.
 async function init() {
   const maxTries = 10;
   const delayMs = 3000;
@@ -49,4 +47,9 @@ async function init() {
   }
 }
 
-module.exports = { pool, init };
+// Convenience query() so server.js can call db.query(...) OR db.pool.query(...)
+function query(text, params) {
+  return pool.query(text, params);
+}
+
+module.exports = { pool, init, query };
