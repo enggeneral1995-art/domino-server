@@ -1,11 +1,11 @@
 {
   "name": "domino-block-server",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Online 1v1 Domino Block backend + auth",
   "main": "server.js",
   "type": "commonjs",
   "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
+  "engines": { "node": "20.x" },
   "dependencies": {
     "express": "^4.19.2",
     "socket.io": "^4.7.5",
