@@ -13,48 +13,10 @@ const db = require('./db');
 const JWT_SECRET =
   process.env.JWT_SECRET || 'change_this_secret_in_railway';
 
-/* =========================================================
-   PASSWORD HASHING
-========================================================= */
-
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto
-    .scryptSync(password, salt, 64)
-    .toString('hex');
-
-  return salt + ':' + derived;
-}
-
-function verifyPassword(password, stored) {
-  try {
-    const [salt, key] = String(stored).split(':');
-
-    const derived = crypto
-      .scryptSync(password, salt, 64)
-      .toString('hex');
-
-    const a = Buffer.from(key, 'hex');
-    const b = Buffer.from(derived, 'hex');
-
-    return (
-      a.length === b.length &&
-      crypto.timingSafeEqual(a, b)
-    );
-  } catch (e) {
-    return false;
-  }
-}
-
-/* =========================================================
-   EXPRESS / SOCKET.IO
-========================================================= */
-
 const app = express();
 
 app.use(express.json({ limit: '1mb' }));
 
-/* CORS */
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header(
@@ -81,17 +43,44 @@ const io = new Server(server, {
   }
 });
 
-/* Health check */
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'Domino Block',
-    version: 'v5-auth-profile-game-usdt'
-  });
-});
+/* =========================================================
+   PASSWORD
+========================================================= */
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+
+  const derived = crypto
+    .scryptSync(password, salt, 64)
+    .toString('hex');
+
+  return salt + ':' + derived;
+}
+
+function verifyPassword(password, stored) {
+  try {
+    const [salt, key] =
+      String(stored).split(':');
+
+    const derived =
+      crypto
+        .scryptSync(password, salt, 64)
+        .toString('hex');
+
+    const a = Buffer.from(key, 'hex');
+    const b = Buffer.from(derived, 'hex');
+
+    return (
+      a.length === b.length &&
+      crypto.timingSafeEqual(a, b)
+    );
+  } catch {
+    return false;
+  }
+}
 
 /* =========================================================
-   AUTH
+   HELPERS
 ========================================================= */
 
 function makeToken(user) {
@@ -112,8 +101,9 @@ function defaultName(user) {
     return user.username;
   }
 
-  return String(user.email || 'player')
-    .split('@')[0];
+  return String(
+    user.email || 'player'
+  ).split('@')[0];
 }
 
 function publicUser(user) {
@@ -122,24 +112,45 @@ function publicUser(user) {
     email: user.email,
     phone: user.phone || null,
 
-    balance: Number(user.balance || 0),
+    balance:
+      Number(user.balance || 0),
 
-    coins: Number(
-      user.coins != null
-        ? user.coins
-        : 500
-    ),
+    coins:
+      Number(
+        user.coins != null
+          ? user.coins
+          : 500
+      ),
 
-    username: defaultName(user),
+    username:
+      defaultName(user),
 
-    wins: Number(user.wins || 0),
-    losses: Number(user.losses || 0),
+    wins:
+      Number(user.wins || 0),
 
-    avatar: user.avatar || null
+    losses:
+      Number(user.losses || 0),
+
+    avatar:
+      user.avatar || null
   };
 }
 
-/* Register */
+/* =========================================================
+   HEALTH
+========================================================= */
+
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'Domino Block',
+    version: 'v6-wallet-safe'
+  });
+});
+
+/* =========================================================
+   AUTH
+========================================================= */
 
 app.post('/api/register', async (req, res) => {
   try {
@@ -151,60 +162,76 @@ app.post('/api/register', async (req, res) => {
 
     if (!email || !password) {
       return res.status(400).json({
-        error: 'email_and_password_required'
+        error:
+          'email_and_password_required'
       });
     }
 
-    email = String(email)
-      .trim()
-      .toLowerCase();
+    email =
+      String(email)
+        .trim()
+        .toLowerCase();
 
-    if (String(password).length < 6) {
+    if (
+      String(password).length < 6
+    ) {
       return res.status(400).json({
-        error: 'password_too_short'
+        error:
+          'password_too_short'
       });
     }
 
-    const exists = await db.query(
-      'SELECT id FROM users WHERE email=$1',
-      [email]
-    );
+    const exists =
+      await db.query(
+        'SELECT id FROM users WHERE email=$1',
+        [email]
+      );
 
     if (exists.rows.length) {
       return res.status(409).json({
-        error: 'email_already_used'
+        error:
+          'email_already_used'
       });
     }
 
-    const passwordHash = hashPassword(password);
+    const passwordHash =
+      hashPassword(password);
 
-    const result = await db.query(
-      `
-      INSERT INTO users
-        (email, phone, password_hash)
-      VALUES
-        ($1, $2, $3)
-      RETURNING *
-      `,
-      [
-        email,
-        phone || null,
-        passwordHash
-      ]
-    );
+    const result =
+      await db.query(
+        `
+        INSERT INTO users
+          (
+            email,
+            phone,
+            password_hash
+          )
+        VALUES
+          ($1, $2, $3)
+        RETURNING *
+        `,
+        [
+          email,
+          phone || null,
+          passwordHash
+        ]
+      );
 
-    const user = result.rows[0];
+    const user =
+      result.rows[0];
 
     res.json({
-      token: makeToken(user),
-      user: publicUser(user)
+      token:
+        makeToken(user),
+
+      user:
+        publicUser(user)
     });
 
   } catch (e) {
     console.error(
       'register error:',
-      e.message,
-      e.code || ''
+      e.message
     );
 
     res.status(500).json({
@@ -212,8 +239,6 @@ app.post('/api/register', async (req, res) => {
     });
   }
 });
-
-/* Login */
 
 app.post('/api/login', async (req, res) => {
   try {
@@ -224,41 +249,50 @@ app.post('/api/login', async (req, res) => {
 
     if (!email || !password) {
       return res.status(400).json({
-        error: 'email_and_password_required'
+        error:
+          'email_and_password_required'
       });
     }
 
-    email = String(email)
-      .trim()
-      .toLowerCase();
+    email =
+      String(email)
+        .trim()
+        .toLowerCase();
 
-    const result = await db.query(
-      'SELECT * FROM users WHERE email=$1',
-      [email]
-    );
+    const result =
+      await db.query(
+        'SELECT * FROM users WHERE email=$1',
+        [email]
+      );
 
     if (!result.rows.length) {
       return res.status(401).json({
-        error: 'invalid_credentials'
+        error:
+          'invalid_credentials'
       });
     }
 
-    const user = result.rows[0];
+    const user =
+      result.rows[0];
 
-    const valid = verifyPassword(
-      password,
-      user.password_hash
-    );
-
-    if (!valid) {
+    if (
+      !verifyPassword(
+        password,
+        user.password_hash
+      )
+    ) {
       return res.status(401).json({
-        error: 'invalid_credentials'
+        error:
+          'invalid_credentials'
       });
     }
 
     res.json({
-      token: makeToken(user),
-      user: publicUser(user)
+      token:
+        makeToken(user),
+
+      user:
+        publicUser(user)
     });
 
   } catch (e) {
@@ -272,8 +306,6 @@ app.post('/api/login', async (req, res) => {
     });
   }
 });
-
-/* Authentication middleware */
 
 function auth(req, res, next) {
   const header =
@@ -291,28 +323,27 @@ function auth(req, res, next) {
   }
 
   try {
-    req.user = jwt.verify(
-      token,
-      JWT_SECRET
-    );
+    req.user =
+      jwt.verify(
+        token,
+        JWT_SECRET
+      );
 
     next();
-
-  } catch (e) {
+  } catch {
     return res.status(401).json({
       error: 'bad_token'
     });
   }
 }
 
-/* Current user */
-
 app.get('/api/me', auth, async (req, res) => {
   try {
-    const result = await db.query(
-      'SELECT * FROM users WHERE id=$1',
-      [req.user.id]
-    );
+    const result =
+      await db.query(
+        'SELECT * FROM users WHERE id=$1',
+        [req.user.id]
+      );
 
     if (!result.rows.length) {
       return res.status(404).json({
@@ -321,10 +352,13 @@ app.get('/api/me', auth, async (req, res) => {
     }
 
     res.json({
-      user: publicUser(result.rows[0])
+      user:
+        publicUser(
+          result.rows[0]
+        )
     });
 
-  } catch (e) {
+  } catch {
     res.status(500).json({
       error: 'server_error'
     });
@@ -335,139 +369,155 @@ app.get('/api/me', auth, async (req, res) => {
    PROFILE
 ========================================================= */
 
-/* Get profile */
+app.get(
+  '/api/profile',
+  auth,
+  async (req, res) => {
+    try {
+      const result =
+        await db.query(
+          'SELECT * FROM users WHERE id=$1',
+          [req.user.id]
+        );
 
-app.get('/api/profile', auth, async (req, res) => {
-  try {
-    const result = await db.query(
-      'SELECT * FROM users WHERE id=$1',
-      [req.user.id]
-    );
+      if (!result.rows.length) {
+        return res.status(404).json({
+          error: 'not_found'
+        });
+      }
 
-    if (!result.rows.length) {
-      return res.status(404).json({
-        error: 'not_found'
+      res.json({
+        user:
+          publicUser(
+            result.rows[0]
+          )
+      });
+
+    } catch {
+      res.status(500).json({
+        error: 'server_error'
       });
     }
-
-    res.json({
-      user: publicUser(result.rows[0])
-    });
-
-  } catch (e) {
-    console.error(
-      'profile get error:',
-      e.message
-    );
-
-    res.status(500).json({
-      error: 'server_error'
-    });
   }
-});
+);
 
-/* Update profile */
-
-app.post('/api/profile', auth, async (req, res) => {
-  try {
-    let {
-      username,
-      avatar
-    } = req.body || {};
-
-    if (
-      username !== undefined &&
-      username !== null
-    ) {
-      username = String(username).trim();
+app.post(
+  '/api/profile',
+  auth,
+  async (req, res) => {
+    try {
+      let {
+        username,
+        avatar
+      } = req.body || {};
 
       if (
-        username.length < 2 ||
-        username.length > 20
+        username !== undefined &&
+        username !== null
       ) {
+        username =
+          String(username).trim();
+
+        if (
+          username.length < 2 ||
+          username.length > 20
+        ) {
+          return res.status(400).json({
+            error:
+              'username_length'
+          });
+        }
+      }
+
+      if (
+        avatar !== undefined &&
+        avatar !== null
+      ) {
+        avatar =
+          String(avatar).trim();
+
+        if (avatar.length > 40) {
+          return res.status(400).json({
+            error:
+              'avatar_invalid'
+          });
+        }
+      }
+
+      const sets = [];
+      const values = [];
+      let index = 1;
+
+      if (
+        username !== undefined &&
+        username !== null
+      ) {
+        sets.push(
+          `username=$${index++}`
+        );
+        values.push(username);
+      }
+
+      if (
+        avatar !== undefined &&
+        avatar !== null
+      ) {
+        sets.push(
+          `avatar=$${index++}`
+        );
+        values.push(avatar);
+      }
+
+      if (!sets.length) {
         return res.status(400).json({
-          error: 'username_length'
+          error:
+            'nothing_to_update'
         });
       }
-    }
 
-    if (
-      avatar !== undefined &&
-      avatar !== null
-    ) {
-      avatar = String(avatar).trim();
+      values.push(req.user.id);
 
-      if (avatar.length > 40) {
-        return res.status(400).json({
-          error: 'avatar_invalid'
-        });
-      }
-    }
+      const result =
+        await db.query(
+          `
+          UPDATE users
+          SET ${sets.join(', ')}
+          WHERE id=$${index}
+          RETURNING *
+          `,
+          values
+        );
 
-    const sets = [];
-    const values = [];
+      res.json({
+        user:
+          publicUser(
+            result.rows[0]
+          )
+      });
 
-    let index = 1;
+    } catch (e) {
+      console.error(
+        'profile update error:',
+        e.message
+      );
 
-    if (
-      username !== undefined &&
-      username !== null
-    ) {
-      sets.push(`username=$${index++}`);
-      values.push(username);
-    }
-
-    if (
-      avatar !== undefined &&
-      avatar !== null
-    ) {
-      sets.push(`avatar=$${index++}`);
-      values.push(avatar);
-    }
-
-    if (!sets.length) {
-      return res.status(400).json({
-        error: 'nothing_to_update'
+      res.status(500).json({
+        error: 'server_error'
       });
     }
-
-    values.push(req.user.id);
-
-    const result = await db.query(
-      `
-      UPDATE users
-      SET ${sets.join(', ')}
-      WHERE id=$${index}
-      RETURNING *
-      `,
-      values
-    );
-
-    res.json({
-      user: publicUser(result.rows[0])
-    });
-
-  } catch (e) {
-    console.error(
-      'profile update error:',
-      e.message
-    );
-
-    res.status(500).json({
-      error: 'server_error'
-    });
   }
-});
+);
 
 /* =========================================================
    USDT WALLET
 ========================================================= */
 
-const USDT_NETWORKS = new Set([
-  'TRC20',
-  'BEP20',
-  'ERC20'
-]);
+const USDT_NETWORKS =
+  new Set([
+    'TRC20',
+    'BEP20',
+    'ERC20'
+  ]);
 
 const USDT_ADDRESSES = {
   TRC20:
@@ -481,52 +531,55 @@ const USDT_ADDRESSES = {
 };
 
 const MIN_WITHDRAW =
-  Number(process.env.USDT_MIN_WITHDRAW || 10);
+  Number(
+    process.env.USDT_MIN_WITHDRAW || 10
+  );
 
 const MAX_WITHDRAW =
-  Number(process.env.USDT_MAX_WITHDRAW || 10000);
+  Number(
+    process.env.USDT_MAX_WITHDRAW || 10000
+  );
 
 const WITHDRAW_FEE =
-  Number(process.env.USDT_WITHDRAW_FEE || 0);
+  Number(
+    process.env.USDT_WITHDRAW_FEE || 0
+  );
 
 const ADMIN_TOKEN =
   process.env.ADMIN_TOKEN || '';
-
-/* Validate USDT address */
 
 function validUsdtAddress(
   network,
   address
 ) {
-  address = String(address || '').trim();
+  address =
+    String(address || '').trim();
 
   if (network === 'TRC20') {
-    return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(
-      address
-    );
+    return /^T[1-9A-HJ-NP-Za-km-z]{33}$/
+      .test(address);
   }
 
   if (
     network === 'BEP20' ||
     network === 'ERC20'
   ) {
-    return /^0x[a-fA-F0-9]{40}$/.test(
-      address
-    );
+    return /^0x[a-fA-F0-9]{40}$/
+      .test(address);
   }
 
   return false;
 }
 
-/* Create wallet tables */
+/* =========================================================
+   WALLET TABLES
+========================================================= */
 
 async function initWalletTables() {
-
   await db.query(`
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS
-      wallet_locked
-      NUMERIC(20,8)
+      wallet_locked NUMERIC(20,8)
       NOT NULL
       DEFAULT 0
   `);
@@ -534,6 +587,7 @@ async function initWalletTables() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS
       wallet_transactions (
+
         id BIGSERIAL PRIMARY KEY,
 
         user_id INTEGER NOT NULL
@@ -593,316 +647,384 @@ async function initWalletTables() {
   `);
 }
 
-/* Get wallet */
-
-app.get('/api/wallet', auth, async (req, res) => {
-  try {
-
-    const result = await db.query(
-      `
-      SELECT
-        balance,
-        wallet_locked
-      FROM users
-      WHERE id=$1
-      `,
-      [req.user.id]
-    );
-
-    if (!result.rows.length) {
-      return res.status(404).json({
-        error: 'not_found'
-      });
-    }
-
-    const user = result.rows[0];
-
-    const balance =
-      Number(user.balance || 0);
-
-    const locked =
-      Number(user.wallet_locked || 0);
-
-    res.json({
-      balance,
-
-      locked_balance: locked,
-
-      available_balance:
-        Math.max(
-          0,
-          balance
-        ),
-
-      currency: 'USDT',
-
-      deposit_addresses:
-        USDT_ADDRESSES,
-
-      networks:
-        Array.from(
-          USDT_NETWORKS
-        ),
-
-      min_withdraw:
-        MIN_WITHDRAW,
-
-      max_withdraw:
-        MAX_WITHDRAW,
-
-      withdraw_fee:
-        WITHDRAW_FEE
-    });
-
-  } catch (e) {
-
-    console.error(
-      'wallet get error:',
-      e.message
-    );
-
-    res.status(500).json({
-      error: 'server_error'
-    });
-  }
-});
-
 /* =========================================================
-   DEPOSIT
+   WALLET
 ========================================================= */
 
-/*
- * Deposit only submits a transaction hash.
- *
- * It DOES NOT automatically add money to balance.
- * The transaction must be verified first.
- */
+app.get(
+  '/api/wallet',
+  auth,
+  async (req, res) => {
+    try {
+      const result =
+        await db.query(
+          `
+          SELECT
+            balance,
+            wallet_locked
+          FROM users
+          WHERE id=$1
+          `,
+          [req.user.id]
+        );
 
-app.post('/api/deposit', auth, async (req, res) => {
-  try {
+      if (!result.rows.length) {
+        return res.status(404).json({
+          error: 'not_found'
+        });
+      }
 
-    const network =
-      String(
-        req.body &&
-        req.body.network ||
-        ''
-      ).toUpperCase();
+      const user =
+        result.rows[0];
 
-    const txHash =
-      String(
-        req.body &&
-        req.body.tx_hash ||
-        ''
-      ).trim();
+      const balance =
+        Number(user.balance || 0);
 
-    if (!USDT_NETWORKS.has(network)) {
-      return res.status(400).json({
-        error: 'invalid_network'
+      const locked =
+        Number(
+          user.wallet_locked || 0
+        );
+
+      res.json({
+        balance,
+        locked_balance: locked,
+
+        available_balance:
+          Math.max(
+            0,
+            balance
+          ),
+
+        currency: 'USDT',
+
+        deposit_addresses:
+          USDT_ADDRESSES,
+
+        networks:
+          Array.from(
+            USDT_NETWORKS
+          ),
+
+        min_withdraw:
+          MIN_WITHDRAW,
+
+        max_withdraw:
+          MAX_WITHDRAW,
+
+        withdraw_fee:
+          WITHDRAW_FEE
+      });
+
+    } catch (e) {
+      console.error(
+        'wallet get error:',
+        e.message
+      );
+
+      res.status(500).json({
+        error: 'server_error'
       });
     }
-
-    if (
-      !txHash ||
-      txHash.length < 20 ||
-      txHash.length > 200
-    ) {
-      return res.status(400).json({
-        error: 'invalid_tx_hash'
-      });
-    }
-
-    const exists = await db.query(
-      `
-      SELECT id
-      FROM wallet_transactions
-      WHERE tx_hash=$1
-      `,
-      [txHash]
-    );
-
-    if (exists.rows.length) {
-      return res.status(409).json({
-        error:
-          'tx_hash_already_submitted'
-      });
-    }
-
-    const result = await db.query(
-      `
-      INSERT INTO wallet_transactions
-        (
-          user_id,
-          type,
-          network,
-          amount,
-          tx_hash,
-          status
-        )
-      VALUES
-        (
-          $1,
-          'deposit',
-          $2,
-          0,
-          $3,
-          'pending'
-        )
-      RETURNING
-        id,
-        type,
-        network,
-        amount,
-        tx_hash,
-        status,
-        created_at
-      `,
-      [
-        req.user.id,
-        network,
-        txHash
-      ]
-    );
-
-    res.json({
-      ok: true,
-
-      transaction:
-        result.rows[0],
-
-      message:
-        'deposit_submitted_for_review'
-    });
-
-  } catch (e) {
-
-    console.error(
-      'deposit error:',
-      e.message
-    );
-
-    res.status(500).json({
-      error: 'server_error'
-    });
   }
-});
+);
+
+/* =========================================================
+   DEPOSIT SUBMISSION
+========================================================= */
+
+app.post(
+  '/api/deposit',
+  auth,
+  async (req, res) => {
+    try {
+      const network =
+        String(
+          req.body?.network || ''
+        ).toUpperCase();
+
+      const txHash =
+        String(
+          req.body?.tx_hash || ''
+        ).trim();
+
+      if (
+        !USDT_NETWORKS.has(network)
+      ) {
+        return res.status(400).json({
+          error:
+            'invalid_network'
+        });
+      }
+
+      if (
+        !txHash ||
+        txHash.length < 20 ||
+        txHash.length > 200
+      ) {
+        return res.status(400).json({
+          error:
+            'invalid_tx_hash'
+        });
+      }
+
+      const exists =
+        await db.query(
+          `
+          SELECT id
+          FROM wallet_transactions
+          WHERE tx_hash=$1
+          `,
+          [txHash]
+        );
+
+      if (exists.rows.length) {
+        return res.status(409).json({
+          error:
+            'tx_hash_already_submitted'
+        });
+      }
+
+      const result =
+        await db.query(
+          `
+          INSERT INTO wallet_transactions
+          (
+            user_id,
+            type,
+            network,
+            amount,
+            tx_hash,
+            status
+          )
+          VALUES
+          (
+            $1,
+            'deposit',
+            $2,
+            0,
+            $3,
+            'pending'
+          )
+          RETURNING
+            id,
+            type,
+            network,
+            amount,
+            tx_hash,
+            status,
+            created_at
+          `,
+          [
+            req.user.id,
+            network,
+            txHash
+          ]
+        );
+
+      res.json({
+        ok: true,
+
+        transaction:
+          result.rows[0],
+
+        message:
+          'deposit_submitted_for_review'
+      });
+
+    } catch (e) {
+      console.error(
+        'deposit error:',
+        e.message
+      );
+
+      if (e.code === '23505') {
+        return res.status(409).json({
+          error:
+            'tx_hash_already_submitted'
+        });
+      }
+
+      res.status(500).json({
+        error: 'server_error'
+      });
+    }
+  }
+);
 
 /* =========================================================
    WITHDRAW
 ========================================================= */
 
-app.post('/api/withdraw', auth, async (req, res) => {
-  try {
-
-    const network =
-      String(
-        req.body &&
-        req.body.network ||
-        ''
-      ).toUpperCase();
-
-    const address =
-      String(
-        req.body &&
-        req.body.address ||
-        ''
-      ).trim();
-
-    const amount =
-      Number(
-        req.body &&
-        req.body.amount
-      );
-
-    if (!USDT_NETWORKS.has(network)) {
-      return res.status(400).json({
-        error: 'invalid_network'
-      });
-    }
-
-    if (
-      !validUsdtAddress(
-        network,
-        address
-      )
-    ) {
-      return res.status(400).json({
-        error:
-          'invalid_address_for_network'
-      });
-    }
-
-    if (
-      !Number.isFinite(amount) ||
-      amount < MIN_WITHDRAW ||
-      amount > MAX_WITHDRAW
-    ) {
-      return res.status(400).json({
-        error: 'invalid_amount',
-        min: MIN_WITHDRAW,
-        max: MAX_WITHDRAW
-      });
-    }
-
-    /*
-     * Reserve the balance.
-     */
-    const result = await db.query(
-      `
-      UPDATE users
-
-      SET
-        balance =
-          balance - $1,
-
-        wallet_locked =
-          wallet_locked + $1
-
-      WHERE
-        id=$2
-        AND balance >= $1
-
-      RETURNING
-        balance,
-        wallet_locked
-      `,
-      [
-        amount,
-        req.user.id
-      ]
-    );
-
-    if (!result.rows.length) {
-      return res.status(400).json({
-        error:
-          'insufficient_balance'
-      });
-    }
+app.post(
+  '/api/withdraw',
+  auth,
+  async (req, res) => {
+    const client =
+      await db.pool.connect();
 
     try {
+      const network =
+        String(
+          req.body?.network || ''
+        ).toUpperCase();
+
+      const address =
+        String(
+          req.body?.address || ''
+        ).trim();
+
+      const amount =
+        Number(
+          req.body?.amount
+        );
+
+      if (
+        !USDT_NETWORKS.has(network)
+      ) {
+        return res.status(400).json({
+          error:
+            'invalid_network'
+        });
+      }
+
+      if (
+        !validUsdtAddress(
+          network,
+          address
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            'invalid_address_for_network'
+        });
+      }
+
+      if (
+        !Number.isFinite(amount) ||
+        amount < MIN_WITHDRAW ||
+        amount > MAX_WITHDRAW
+      ) {
+        return res.status(400).json({
+          error:
+            'invalid_amount',
+
+          min:
+            MIN_WITHDRAW,
+
+          max:
+            MAX_WITHDRAW
+        });
+      }
+
+      await client.query(
+        'BEGIN'
+      );
+
+      /*
+       * Lock this user's row.
+       * This prevents two simultaneous
+       * withdrawals from spending the
+       * same balance.
+       */
+
+      const userResult =
+        await client.query(
+          `
+          SELECT
+            id,
+            balance,
+            wallet_locked
+
+          FROM users
+
+          WHERE id=$1
+
+          FOR UPDATE
+          `,
+          [req.user.id]
+        );
+
+      if (
+        !userResult.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res.status(404).json({
+          error:
+            'not_found'
+        });
+      }
+
+      const balance =
+        Number(
+          userResult.rows[0]
+            .balance || 0
+        );
+
+      if (balance < amount) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res.status(400).json({
+          error:
+            'insufficient_balance'
+        });
+      }
+
+      /*
+       * Reserve balance.
+       */
+
+      const updated =
+        await client.query(
+          `
+          UPDATE users
+
+          SET
+            balance =
+              balance - $1,
+
+            wallet_locked =
+              wallet_locked + $1
+
+          WHERE id=$2
+
+          RETURNING
+            balance,
+            wallet_locked
+          `,
+          [
+            amount,
+            req.user.id
+          ]
+        );
 
       const withdrawal =
-        await db.query(
+        await client.query(
           `
           INSERT INTO wallet_transactions
-            (
-              user_id,
-              type,
-              network,
-              amount,
-              address,
-              status,
-              fee
-            )
+          (
+            user_id,
+            type,
+            network,
+            amount,
+            address,
+            status,
+            fee
+          )
           VALUES
-            (
-              $1,
-              'withdraw',
-              $2,
-              $3,
-              $4,
-              'pending',
-              $5
-            )
+          (
+            $1,
+            'withdraw',
+            $2,
+            $3,
+            $4,
+            'pending',
+            $5
+          )
           RETURNING
             id,
             type,
@@ -922,6 +1044,10 @@ app.post('/api/withdraw', auth, async (req, res) => {
           ]
         );
 
+      await client.query(
+        'COMMIT'
+      );
+
       res.json({
         ok: true,
 
@@ -930,12 +1056,14 @@ app.post('/api/withdraw', auth, async (req, res) => {
 
         balance:
           Number(
-            result.rows[0].balance
+            updated.rows[0]
+              .balance
           ),
 
         locked_balance:
           Number(
-            result.rows[0].wallet_locked
+            updated.rows[0]
+              .wallet_locked
           ),
 
         message:
@@ -943,85 +1071,62 @@ app.post('/api/withdraw', auth, async (req, res) => {
       });
 
     } catch (e) {
+      try {
+        await client.query(
+          'ROLLBACK'
+        );
+      } catch {}
 
-      /*
-       * Roll back balance reservation
-       * if transaction creation fails.
-       */
-
-      await db.query(
-        `
-        UPDATE users
-        SET
-          balance =
-            balance + $1,
-
-          wallet_locked =
-            GREATEST(
-              0,
-              wallet_locked - $1
-            )
-
-        WHERE id=$2
-        `,
-        [
-          amount,
-          req.user.id
-        ]
+      console.error(
+        'withdraw error:',
+        e.message
       );
 
-      throw e;
+      res.status(500).json({
+        error: 'server_error'
+      });
+
+    } finally {
+      client.release();
     }
-
-  } catch (e) {
-
-    console.error(
-      'withdraw error:',
-      e.message
-    );
-
-    res.status(500).json({
-      error: 'server_error'
-    });
   }
-});
+);
 
 /* =========================================================
-   WALLET TRANSACTION HISTORY
+   WALLET HISTORY
 ========================================================= */
 
 app.get(
   '/api/wallet/transactions',
   auth,
   async (req, res) => {
-
     try {
+      const result =
+        await db.query(
+          `
+          SELECT
+            id,
+            type,
+            network,
+            amount,
+            address,
+            tx_hash,
+            status,
+            fee,
+            created_at,
+            updated_at
 
-      const result = await db.query(
-        `
-        SELECT
-          id,
-          type,
-          network,
-          amount,
-          address,
-          tx_hash,
-          status,
-          fee,
-          created_at,
-          updated_at
+          FROM wallet_transactions
 
-        FROM wallet_transactions
+          WHERE user_id=$1
 
-        WHERE user_id=$1
+          ORDER BY
+            created_at DESC
 
-        ORDER BY
-          created_at DESC
-
-        LIMIT 50
-        `,
-        [req.user.id]
-      );
+          LIMIT 50
+          `,
+          [req.user.id]
+        );
 
       res.json({
         transactions:
@@ -1029,7 +1134,6 @@ app.get(
       });
 
     } catch (e) {
-
       console.error(
         'wallet history error:',
         e.message
@@ -1046,111 +1150,84 @@ app.get(
    ADMIN
 ========================================================= */
 
-function adminOnly(req, res, next) {
-
+function adminOnly(
+  req,
+  res,
+  next
+) {
   if (
     !ADMIN_TOKEN ||
     req.headers['x-admin-token'] !==
       ADMIN_TOKEN
   ) {
     return res.status(403).json({
-      error: 'admin_forbidden'
+      error:
+        'admin_forbidden'
     });
   }
 
   next();
 }
 
-/* Get all wallet transactions */
-
 app.get(
   '/api/admin/wallet/transactions',
   adminOnly,
-  async (req, res) => {
-
+  async (_req, res) => {
     try {
+      const result =
+        await db.query(
+          `
+          SELECT
+            id,
+            user_id,
+            type,
+            network,
+            amount,
+            address,
+            tx_hash,
+            status,
+            fee,
+            created_at,
+            updated_at
 
-      const result = await db.query(
-        `
-        SELECT
-          id,
-          user_id,
-          type,
-          network,
-          amount,
-          address,
-          tx_hash,
-          status,
-          fee,
-          created_at
+          FROM wallet_transactions
 
-        FROM wallet_transactions
+          ORDER BY
+            created_at DESC
 
-        ORDER BY
-          created_at DESC
-
-        LIMIT 200
-        `
-      );
+          LIMIT 200
+          `
+        );
 
       res.json({
         transactions:
           result.rows
       });
 
-    } catch (e) {
-
+    } catch {
       res.status(500).json({
-        error: 'server_error'
+        error:
+          'server_error'
       });
     }
   }
 );
 
-/* Approve deposit */
+/* =========================================================
+   ADMIN — APPROVE DEPOSIT
+========================================================= */
 
 app.post(
   '/api/admin/wallet/deposit/:id/approve',
   adminOnly,
   async (req, res) => {
+    const client =
+      await db.pool.connect();
 
     try {
-
-      const result = await db.query(
-        `
-        SELECT *
-        FROM wallet_transactions
-
-        WHERE
-          id=$1
-          AND type='deposit'
-        `,
-        [req.params.id]
-      );
-
-      if (!result.rows.length) {
-        return res.status(404).json({
-          error: 'not_found'
-        });
-      }
-
-      const transaction =
-        result.rows[0];
-
-      if (
-        transaction.status !==
-        'pending'
-      ) {
-        return res.status(409).json({
-          error:
-            'already_processed'
-        });
-      }
-
       const amount =
         Number(
-          req.body &&
-          req.body.amount
+          req.body?.amount
         );
 
       if (
@@ -1163,15 +1240,102 @@ app.post(
         });
       }
 
+      await client.query(
+        'BEGIN'
+      );
+
       /*
-       * Add verified amount to
-       * user's USDT balance.
+       * Lock transaction row.
+       */
+
+      const txResult =
+        await client.query(
+          `
+          SELECT *
+          FROM wallet_transactions
+
+          WHERE
+            id=$1
+            AND type='deposit'
+
+          FOR UPDATE
+          `,
+          [req.params.id]
+        );
+
+      if (
+        !txResult.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res.status(404).json({
+          error:
+            'not_found'
+        });
+      }
+
+      const transaction =
+        txResult.rows[0];
+
+      if (
+        transaction.status !==
+        'pending'
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res.status(409).json({
+          error:
+            'already_processed'
+        });
+      }
+
+      /*
+       * Lock user row.
+       */
+
+      const userResult =
+        await client.query(
+          `
+          SELECT
+            balance
+
+          FROM users
+
+          WHERE id=$1
+
+          FOR UPDATE
+          `,
+          [
+            transaction.user_id
+          ]
+        );
+
+      if (
+        !userResult.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res.status(404).json({
+          error:
+            'user_not_found'
+        });
+      }
+
+      /*
+       * Credit verified deposit.
        */
 
       const updated =
-        await db.query(
+        await client.query(
           `
           UPDATE users
+
           SET
             balance =
               balance + $1
@@ -1186,7 +1350,7 @@ app.post(
           ]
         );
 
-      await db.query(
+      await client.query(
         `
         UPDATE wallet_transactions
 
@@ -1203,16 +1367,26 @@ app.post(
         ]
       );
 
+      await client.query(
+        'COMMIT'
+      );
+
       res.json({
         ok: true,
 
         balance:
           Number(
-            updated.rows[0].balance
+            updated.rows[0]
+              .balance
           )
       });
 
     } catch (e) {
+      try {
+        await client.query(
+          'ROLLBACK'
+        );
+      } catch {}
 
       console.error(
         'deposit approve error:',
@@ -1220,62 +1394,84 @@ app.post(
       );
 
       res.status(500).json({
-        error: 'server_error'
+        error:
+          'server_error'
       });
+
+    } finally {
+      client.release();
     }
   }
 );
 
-/* Complete withdrawal */
+/* =========================================================
+   ADMIN — COMPLETE WITHDRAW
+========================================================= */
 
 app.post(
   '/api/admin/wallet/withdraw/:id/complete',
   adminOnly,
   async (req, res) => {
+    const client =
+      await db.pool.connect();
 
     try {
-
-      const result = await db.query(
-        `
-        SELECT *
-        FROM wallet_transactions
-
-        WHERE
-          id=$1
-          AND type='withdraw'
-        `,
-        [req.params.id]
+      await client.query(
+        'BEGIN'
       );
 
-      if (!result.rows.length) {
+      const txResult =
+        await client.query(
+          `
+          SELECT *
+          FROM wallet_transactions
+
+          WHERE
+            id=$1
+            AND type='withdraw'
+
+          FOR UPDATE
+          `,
+          [req.params.id]
+        );
+
+      if (
+        !txResult.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
         return res.status(404).json({
-          error: 'not_found'
+          error:
+            'not_found'
         });
       }
 
       const transaction =
-        result.rows[0];
+        txResult.rows[0];
 
       if (
         transaction.status !==
         'pending'
       ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
         return res.status(409).json({
           error:
             'already_processed'
         });
       }
 
-      /*
-       * The amount was already removed
-       * from spendable balance.
-       *
-       * Here we release the locked amount
-       * after the external payout is confirmed.
-       */
+      const amount =
+        Number(
+          transaction.amount
+        );
 
       const updated =
-        await db.query(
+        await client.query(
           `
           UPDATE users
 
@@ -1293,14 +1489,25 @@ app.post(
             wallet_locked
           `,
           [
-            Number(
-              transaction.amount
-            ),
+            amount,
             transaction.user_id
           ]
         );
 
-      await db.query(
+      if (
+        !updated.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res.status(404).json({
+          error:
+            'user_not_found'
+        });
+      }
+
+      await client.query(
         `
         UPDATE wallet_transactions
 
@@ -1313,12 +1520,17 @@ app.post(
         [transaction.id]
       );
 
+      await client.query(
+        'COMMIT'
+      );
+
       res.json({
         ok: true,
 
         balance:
           Number(
-            updated.rows[0].balance
+            updated.rows[0]
+              .balance
           ),
 
         locked_balance:
@@ -1329,6 +1541,11 @@ app.post(
       });
 
     } catch (e) {
+      try {
+        await client.query(
+          'ROLLBACK'
+        );
+      } catch {}
 
       console.error(
         'withdraw complete error:',
@@ -1336,59 +1553,84 @@ app.post(
       );
 
       res.status(500).json({
-        error: 'server_error'
+        error:
+          'server_error'
       });
+
+    } finally {
+      client.release();
     }
   }
 );
 
-/* Reject withdrawal */
+/* =========================================================
+   ADMIN — REJECT WITHDRAW
+========================================================= */
 
 app.post(
   '/api/admin/wallet/withdraw/:id/reject',
   adminOnly,
   async (req, res) => {
+    const client =
+      await db.pool.connect();
 
     try {
-
-      const result = await db.query(
-        `
-        SELECT *
-        FROM wallet_transactions
-
-        WHERE
-          id=$1
-          AND type='withdraw'
-        `,
-        [req.params.id]
+      await client.query(
+        'BEGIN'
       );
 
-      if (!result.rows.length) {
+      const txResult =
+        await client.query(
+          `
+          SELECT *
+          FROM wallet_transactions
+
+          WHERE
+            id=$1
+            AND type='withdraw'
+
+          FOR UPDATE
+          `,
+          [req.params.id]
+        );
+
+      if (
+        !txResult.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
         return res.status(404).json({
-          error: 'not_found'
+          error:
+            'not_found'
         });
       }
 
       const transaction =
-        result.rows[0];
+        txResult.rows[0];
 
       if (
         transaction.status !==
         'pending'
       ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
         return res.status(409).json({
           error:
             'already_processed'
         });
       }
 
-      /*
-       * Return reserved balance
-       * to the user.
-       */
+      const amount =
+        Number(
+          transaction.amount
+        );
 
       const updated =
-        await db.query(
+        await client.query(
           `
           UPDATE users
 
@@ -1409,14 +1651,25 @@ app.post(
             wallet_locked
           `,
           [
-            Number(
-              transaction.amount
-            ),
+            amount,
             transaction.user_id
           ]
         );
 
-      await db.query(
+      if (
+        !updated.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res.status(404).json({
+          error:
+            'user_not_found'
+        });
+      }
+
+      await client.query(
         `
         UPDATE wallet_transactions
 
@@ -1429,12 +1682,17 @@ app.post(
         [transaction.id]
       );
 
+      await client.query(
+        'COMMIT'
+      );
+
       res.json({
         ok: true,
 
         balance:
           Number(
-            updated.rows[0].balance
+            updated.rows[0]
+              .balance
           ),
 
         locked_balance:
@@ -1445,6 +1703,11 @@ app.post(
       });
 
     } catch (e) {
+      try {
+        await client.query(
+          'ROLLBACK'
+        );
+      } catch {}
 
       console.error(
         'withdraw reject error:',
@@ -1452,8 +1715,12 @@ app.post(
       );
 
       res.status(500).json({
-        error: 'server_error'
+        error:
+          'server_error'
       });
+
+    } finally {
+      client.release();
     }
   }
 );
@@ -1466,25 +1733,24 @@ app.post(
   '/api/game-result',
   auth,
   async (req, res) => {
-
     try {
-
       const result =
-        req.body &&
-        req.body.result === 'win'
+        req.body?.result === 'win'
           ? 'win'
           : 'loss';
 
       let entry =
         parseInt(
-          req.body &&
-          req.body.entry,
+          req.body?.entry,
           10
         );
 
       if (
-        ![100, 200, 500]
-          .includes(entry)
+        ![
+          100,
+          200,
+          500
+        ].includes(entry)
       ) {
         entry = 100;
       }
@@ -1495,9 +1761,12 @@ app.post(
           [req.user.id]
         );
 
-      if (!resultUser.rows.length) {
+      if (
+        !resultUser.rows.length
+      ) {
         return res.status(404).json({
-          error: 'not_found'
+          error:
+            'not_found'
         });
       }
 
@@ -1505,21 +1774,26 @@ app.post(
         resultUser.rows[0];
 
       let coins =
-        Number(user.coins || 0);
+        Number(
+          user.coins || 0
+        );
 
       let wins =
-        Number(user.wins || 0);
+        Number(
+          user.wins || 0
+        );
 
       let losses =
-        Number(user.losses || 0);
+        Number(
+          user.losses || 0
+        );
 
-      if (result === 'win') {
-
+      if (
+        result === 'win'
+      ) {
         coins += entry;
         wins += 1;
-
       } else {
-
         coins =
           Math.max(
             0,
@@ -1559,14 +1833,14 @@ app.post(
       });
 
     } catch (e) {
-
       console.error(
         'game-result error:',
         e.message
       );
 
       res.status(500).json({
-        error: 'server_error'
+        error:
+          'server_error'
       });
     }
   }
@@ -1608,13 +1882,11 @@ const TILE_VALUES = [
 ];
 
 function shuffle(array) {
-
   for (
     let i = array.length - 1;
     i > 0;
     i--
   ) {
-
     const j =
       Math.floor(
         Math.random() *
@@ -1634,7 +1906,6 @@ function shuffle(array) {
 }
 
 function dealRound() {
-
   const deck =
     shuffle([
       ...Array(28).keys()
@@ -1647,17 +1918,14 @@ function dealRound() {
     deck.slice(7, 14);
 
   let starterSeat = 0;
-
   let bestDbl = -1;
   let bestSum = -1;
 
   const scan =
     (hand, seat) => {
-
       for (
         const value of hand
       ) {
-
         const tile =
           TILE_VALUES[value];
 
@@ -1677,15 +1945,14 @@ function dealRound() {
   scan(handA, 0);
   scan(handB, 1);
 
-  if (bestDbl < 0) {
-
+  if (
+    bestDbl < 0
+  ) {
     const scanSum =
       (hand, seat) => {
-
         for (
           const value of hand
         ) {
-
           const tile =
             TILE_VALUES[value];
 
@@ -1693,12 +1960,11 @@ function dealRound() {
             tile[0] +
             tile[1];
 
-          if (sum > bestSum) {
-
+          if (
+            sum > bestSum
+          ) {
             bestSum = sum;
-
-            starterSeat =
-              seat;
+            starterSeat = seat;
           }
         }
       };
@@ -1714,30 +1980,21 @@ function dealRound() {
   };
 }
 
-/* Matchmaking */
-
 let waiting = null;
-
-const rooms =
-  new Map();
-
-const socketRoom =
-  new Map();
-
+const rooms = new Map();
+const socketRoom = new Map();
 let sequence = 1;
 
 function otherPlayer(
   room,
   socketId
 ) {
-
   return room.players[0] === socketId
     ? room.players[1]
     : room.players[0];
 }
 
 function startRound(room) {
-
   const round =
     dealRound();
 
@@ -1747,16 +2004,12 @@ function startRound(room) {
     'online_start',
     {
       seat: 0,
-
       yourHand:
         round.handA,
-
       oppHand:
         round.handB,
-
       starterSeat:
         round.starterSeat,
-
       goal:
         room.goal
     }
@@ -1768,39 +2021,33 @@ function startRound(room) {
     'online_start',
     {
       seat: 1,
-
       yourHand:
         round.handB,
-
       oppHand:
         round.handA,
-
       starterSeat:
         round.starterSeat,
-
       goal:
         room.goal
     }
   );
 }
 
-/* Socket connection */
-
 io.on(
   'connection',
   socket => {
 
-    /* Find opponent */
-
     socket.on(
       'find_match',
       (options = {}) => {
-
         const goal =
-          [100, 200, 500]
-            .includes(
-              options.goal
-            )
+          [
+            100,
+            200,
+            500
+          ].includes(
+            options.goal
+          )
             ? options.goal
             : 100;
 
@@ -1824,21 +2071,19 @@ io.on(
           waiting.socket.id !==
             socket.id
         ) {
-
           const p1 =
             waiting.socket;
 
           const p1info =
             waiting.info || {
-              name: 'Player',
-              avatar: ''
+              name:
+                'Player',
+              avatar:
+                ''
             };
 
           const p2 =
             socket;
-
-          const p2info =
-            player;
 
           waiting = null;
 
@@ -1851,7 +2096,6 @@ io.on(
               p1.id,
               p2.id
             ],
-
             goal
           };
 
@@ -1873,16 +2117,20 @@ io.on(
           p1.join(roomId);
           p2.join(roomId);
 
-          io.to(p1.id).emit(
+          io.to(
+            p1.id
+          ).emit(
             'matched',
             {
               seat: 0,
               goal,
-              opp: p2info
+              opp: player
             }
           );
 
-          io.to(p2.id).emit(
+          io.to(
+            p2.id
+          ).emit(
             'matched',
             {
               seat: 1,
@@ -1894,7 +2142,6 @@ io.on(
           startRound(room);
 
         } else {
-
           waiting = {
             socket,
             goal,
@@ -1908,12 +2155,9 @@ io.on(
       }
     );
 
-    /* Game move relay */
-
     socket.on(
       'game_move',
       message => {
-
         const roomId =
           socketRoom.get(
             socket.id
@@ -1945,12 +2189,9 @@ io.on(
       }
     );
 
-    /* Next round */
-
     socket.on(
       'next_round',
       () => {
-
         const roomId =
           socketRoom.get(
             socket.id
@@ -1971,12 +2212,9 @@ io.on(
       }
     );
 
-    /* Cancel matchmaking */
-
     socket.on(
       'cancel_find',
       () => {
-
         if (
           waiting &&
           waiting.socket.id ===
@@ -1987,12 +2225,9 @@ io.on(
       }
     );
 
-    /* Disconnect */
-
     socket.on(
       'disconnect',
       () => {
-
         if (
           waiting &&
           waiting.socket.id ===
@@ -2010,7 +2245,6 @@ io.on(
           roomId &&
           rooms.has(roomId)
         ) {
-
           const room =
             rooms.get(roomId);
 
@@ -2021,7 +2255,6 @@ io.on(
             );
 
           if (opponent) {
-
             io.to(
               opponent
             ).emit(
@@ -2045,16 +2278,14 @@ io.on(
 );
 
 /* =========================================================
-   START SERVER
+   START
 ========================================================= */
 
 const PORT =
   process.env.PORT || 3000;
 
 async function startServer() {
-
   try {
-
     await db.init();
 
     await initWalletTables();
@@ -2070,7 +2301,6 @@ async function startServer() {
     );
 
   } catch (error) {
-
     console.error(
       'DB/server startup failed:',
       error
