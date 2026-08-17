@@ -1,9 +1,8 @@
 /*
- * server.js — Domino Block online server (v4)
- * - Auth API (register / login / me) backed by PostgreSQL
- * - Profile API (get / update: username, avatar, wins, losses)
- * - Online 1v1 game via lockstep relay (matchmaking + shared deck + move relay)
+ * server.js — Domino Block Online Server
+ * Auth + Profile + Online 1v1 + USDT Wallet
  */
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -11,248 +10,2074 @@ const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const db = require('./db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret_in_railway';
+const JWT_SECRET =
+  process.env.JWT_SECRET || 'change_this_secret_in_railway';
 
-// password hashing using Node's built-in crypto (no external deps)
-function hashPassword(password){
+/* =========================================================
+   PASSWORD HASHING
+========================================================= */
+
+function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex');
-  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  const derived = crypto
+    .scryptSync(password, salt, 64)
+    .toString('hex');
+
   return salt + ':' + derived;
 }
-function verifyPassword(password, stored){
+
+function verifyPassword(password, stored) {
   try {
     const [salt, key] = String(stored).split(':');
-    const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+
+    const derived = crypto
+      .scryptSync(password, salt, 64)
+      .toString('hex');
+
     const a = Buffer.from(key, 'hex');
     const b = Buffer.from(derived, 'hex');
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch(e){ return false; }
+
+    return (
+      a.length === b.length &&
+      crypto.timingSafeEqual(a, b)
+    );
+  } catch (e) {
+    return false;
+  }
 }
 
-const app = express();
-app.use(express.json());
+/* =========================================================
+   EXPRESS / SOCKET.IO
+========================================================= */
 
-// allow the game (on Netlify) to call this API from another domain
+const app = express();
+
+app.use(express.json({ limit: '1mb' }));
+
+/* CORS */
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  res.header(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, X-Admin-Token'
+  );
+  res.header(
+    'Access-Control-Allow-Methods',
+    'GET, POST, OPTIONS'
+  );
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+
   next();
 });
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
 
-app.get('/', (_req, res) => res.send('Domino Block server is running (v4 auth + profile + game)'));
+const io = new Server(server, {
+  cors: {
+    origin: '*'
+  }
+});
 
-/* ---------------- AUTH ---------------- */
-function makeToken(user){ return jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' }); }
+/* Health check */
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'Domino Block',
+    version: 'v5-auth-profile-game-usdt'
+  });
+});
 
-// default username from the email (before the @), used only if none set yet
-function defaultName(u){
-  if (u.username) return u.username;
-  return String(u.email || 'player').split('@')[0];
+/* =========================================================
+   AUTH
+========================================================= */
+
+function makeToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email
+    },
+    JWT_SECRET,
+    {
+      expiresIn: '30d'
+    }
+  );
 }
-function publicUser(u){
+
+function defaultName(user) {
+  if (user.username) {
+    return user.username;
+  }
+
+  return String(user.email || 'player')
+    .split('@')[0];
+}
+
+function publicUser(user) {
   return {
-    id: u.id,
-    email: u.email,
-    phone: u.phone,
-    balance: Number(u.balance),
-    coins: Number(u.coins != null ? u.coins : 500),
-    username: defaultName(u),
-    wins: Number(u.wins || 0),
-    losses: Number(u.losses || 0),
-    avatar: u.avatar || null
+    id: user.id,
+    email: user.email,
+    phone: user.phone || null,
+
+    balance: Number(user.balance || 0),
+
+    coins: Number(
+      user.coins != null
+        ? user.coins
+        : 500
+    ),
+
+    username: defaultName(user),
+
+    wins: Number(user.wins || 0),
+    losses: Number(user.losses || 0),
+
+    avatar: user.avatar || null
   };
 }
 
+/* Register */
+
 app.post('/api/register', async (req, res) => {
   try {
-    let { email, phone, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'email_and_password_required' });
-    email = String(email).trim().toLowerCase();
-    if (password.length < 6) return res.status(400).json({ error: 'password_too_short' });
+    let {
+      email,
+      phone,
+      password
+    } = req.body || {};
 
-    const exists = await db.query('SELECT id FROM users WHERE email=$1', [email]);
-    if (exists.rows.length) return res.status(409).json({ error: 'email_already_used' });
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'email_and_password_required'
+      });
+    }
 
-    const hash = hashPassword(password);
-    const r = await db.query(
-      'INSERT INTO users (email, phone, password_hash) VALUES ($1,$2,$3) RETURNING *',
-      [email, phone || null, hash]
+    email = String(email)
+      .trim()
+      .toLowerCase();
+
+    if (String(password).length < 6) {
+      return res.status(400).json({
+        error: 'password_too_short'
+      });
+    }
+
+    const exists = await db.query(
+      'SELECT id FROM users WHERE email=$1',
+      [email]
     );
-    const user = r.rows[0];
-    res.json({ token: makeToken(user), user: publicUser(user) });
+
+    if (exists.rows.length) {
+      return res.status(409).json({
+        error: 'email_already_used'
+      });
+    }
+
+    const passwordHash = hashPassword(password);
+
+    const result = await db.query(
+      `
+      INSERT INTO users
+        (email, phone, password_hash)
+      VALUES
+        ($1, $2, $3)
+      RETURNING *
+      `,
+      [
+        email,
+        phone || null,
+        passwordHash
+      ]
+    );
+
+    const user = result.rows[0];
+
+    res.json({
+      token: makeToken(user),
+      user: publicUser(user)
+    });
+
   } catch (e) {
-    console.error('register error:', e.message, e.code||'');
-    res.status(500).json({ error: 'server_error' });
+    console.error(
+      'register error:',
+      e.message,
+      e.code || ''
+    );
+
+    res.status(500).json({
+      error: 'server_error'
+    });
   }
 });
+
+/* Login */
 
 app.post('/api/login', async (req, res) => {
   try {
-    let { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'email_and_password_required' });
-    email = String(email).trim().toLowerCase();
+    let {
+      email,
+      password
+    } = req.body || {};
 
-    const r = await db.query('SELECT * FROM users WHERE email=$1', [email]);
-    if (!r.rows.length) return res.status(401).json({ error: 'invalid_credentials' });
-    const user = r.rows[0];
-    const ok = verifyPassword(password, user.password_hash);
-    if (!ok) return res.status(401).json({ error: 'invalid_credentials' });
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'email_and_password_required'
+      });
+    }
 
-    res.json({ token: makeToken(user), user: publicUser(user) });
+    email = String(email)
+      .trim()
+      .toLowerCase();
+
+    const result = await db.query(
+      'SELECT * FROM users WHERE email=$1',
+      [email]
+    );
+
+    if (!result.rows.length) {
+      return res.status(401).json({
+        error: 'invalid_credentials'
+      });
+    }
+
+    const user = result.rows[0];
+
+    const valid = verifyPassword(
+      password,
+      user.password_hash
+    );
+
+    if (!valid) {
+      return res.status(401).json({
+        error: 'invalid_credentials'
+      });
+    }
+
+    res.json({
+      token: makeToken(user),
+      user: publicUser(user)
+    });
+
   } catch (e) {
-    console.error('login error:', e.message, e.code||'');
-    res.status(500).json({ error: 'server_error' });
+    console.error(
+      'login error:',
+      e.message
+    );
+
+    res.status(500).json({
+      error: 'server_error'
+    });
   }
 });
 
-function auth(req, res, next){
-  const h = req.headers.authorization || '';
-  const t = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!t) return res.status(401).json({ error: 'no_token' });
-  try { req.user = jwt.verify(t, JWT_SECRET); next(); }
-  catch(e){ res.status(401).json({ error: 'bad_token' }); }
+/* Authentication middleware */
+
+function auth(req, res, next) {
+  const header =
+    req.headers.authorization || '';
+
+  const token =
+    header.startsWith('Bearer ')
+      ? header.slice(7)
+      : null;
+
+  if (!token) {
+    return res.status(401).json({
+      error: 'no_token'
+    });
+  }
+
+  try {
+    req.user = jwt.verify(
+      token,
+      JWT_SECRET
+    );
+
+    next();
+
+  } catch (e) {
+    return res.status(401).json({
+      error: 'bad_token'
+    });
+  }
 }
+
+/* Current user */
 
 app.get('/api/me', auth, async (req, res) => {
   try {
-    const r = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
-    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
-    res.json({ user: publicUser(r.rows[0]) });
-  } catch(e){ res.status(500).json({ error: 'server_error' }); }
+    const result = await db.query(
+      'SELECT * FROM users WHERE id=$1',
+      [req.user.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: 'not_found'
+      });
+    }
+
+    res.json({
+      user: publicUser(result.rows[0])
+    });
+
+  } catch (e) {
+    res.status(500).json({
+      error: 'server_error'
+    });
+  }
 });
 
-/* ---------------- PROFILE ---------------- */
+/* =========================================================
+   PROFILE
+========================================================= */
 
-// get my full profile
+/* Get profile */
+
 app.get('/api/profile', auth, async (req, res) => {
   try {
-    const r = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
-    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
-    res.json({ user: publicUser(r.rows[0]) });
-  } catch(e){
-    console.error('profile get error:', e.message);
-    res.status(500).json({ error: 'server_error' });
+    const result = await db.query(
+      'SELECT * FROM users WHERE id=$1',
+      [req.user.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: 'not_found'
+      });
+    }
+
+    res.json({
+      user: publicUser(result.rows[0])
+    });
+
+  } catch (e) {
+    console.error(
+      'profile get error:',
+      e.message
+    );
+
+    res.status(500).json({
+      error: 'server_error'
+    });
   }
 });
 
-// update username and/or avatar
+/* Update profile */
+
 app.post('/api/profile', auth, async (req, res) => {
   try {
-    let { username, avatar } = req.body || {};
+    let {
+      username,
+      avatar
+    } = req.body || {};
 
-    // validate username (optional)
-    if (username !== undefined && username !== null) {
+    if (
+      username !== undefined &&
+      username !== null
+    ) {
       username = String(username).trim();
-      if (username.length < 2 || username.length > 20) {
-        return res.status(400).json({ error: 'username_length' });
+
+      if (
+        username.length < 2 ||
+        username.length > 20
+      ) {
+        return res.status(400).json({
+          error: 'username_length'
+        });
       }
     }
-    // validate avatar (optional): accept a short id/name like "a1".."a12" or a small string
-    if (avatar !== undefined && avatar !== null) {
+
+    if (
+      avatar !== undefined &&
+      avatar !== null
+    ) {
       avatar = String(avatar).trim();
-      if (avatar.length > 40) return res.status(400).json({ error: 'avatar_invalid' });
+
+      if (avatar.length > 40) {
+        return res.status(400).json({
+          error: 'avatar_invalid'
+        });
+      }
     }
 
-    // build a dynamic update only for the fields provided
     const sets = [];
-    const vals = [];
-    let i = 1;
-    if (username !== undefined && username !== null) { sets.push(`username=$${i++}`); vals.push(username); }
-    if (avatar !== undefined && avatar !== null)     { sets.push(`avatar=$${i++}`);   vals.push(avatar); }
+    const values = [];
 
-    if (!sets.length) return res.status(400).json({ error: 'nothing_to_update' });
+    let index = 1;
 
-    vals.push(req.user.id);
-    const r = await db.query(
-      `UPDATE users SET ${sets.join(', ')} WHERE id=$${i} RETURNING *`,
-      vals
+    if (
+      username !== undefined &&
+      username !== null
+    ) {
+      sets.push(`username=$${index++}`);
+      values.push(username);
+    }
+
+    if (
+      avatar !== undefined &&
+      avatar !== null
+    ) {
+      sets.push(`avatar=$${index++}`);
+      values.push(avatar);
+    }
+
+    if (!sets.length) {
+      return res.status(400).json({
+        error: 'nothing_to_update'
+      });
+    }
+
+    values.push(req.user.id);
+
+    const result = await db.query(
+      `
+      UPDATE users
+      SET ${sets.join(', ')}
+      WHERE id=$${index}
+      RETURNING *
+      `,
+      values
     );
-    res.json({ user: publicUser(r.rows[0]) });
-  } catch(e){
-    console.error('profile update error:', e.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
 
-/* ---------------- GAME RESULT (offline vs computer) ---------------- */
-// Awards/deducts FREE coins and updates wins/losses. Coins have no cash value.
-app.post('/api/game-result', auth, async (req, res) => {
-  try {
-    const result = (req.body && req.body.result) === 'win' ? 'win' : 'loss';
-    let entry = parseInt(req.body && req.body.entry, 10);
-    if (![100, 200, 500].includes(entry)) entry = 100;
+    res.json({
+      user: publicUser(result.rows[0])
+    });
 
-    const r = await db.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
-    if (!r.rows.length) return res.status(404).json({ error: 'not_found' });
-    const u = r.rows[0];
-
-    let coins = Number(u.coins || 0);
-    let wins = Number(u.wins || 0);
-    let losses = Number(u.losses || 0);
-
-    if (result === 'win') { coins += entry; wins += 1; }          // winner takes the pot (no fee)
-    else { coins = Math.max(0, coins - entry); losses += 1; }
-
-    const up = await db.query(
-      'UPDATE users SET coins=$1, wins=$2, losses=$3 WHERE id=$4 RETURNING *',
-      [coins, wins, losses, req.user.id]
-    );
-    res.json({ user: publicUser(up.rows[0]) });
   } catch (e) {
-    console.error('game-result error:', e.message);
-    res.status(500).json({ error: 'server_error' });
+    console.error(
+      'profile update error:',
+      e.message
+    );
+
+    res.status(500).json({
+      error: 'server_error'
+    });
   }
 });
 
-/* ---------------- GAME (lockstep relay) ---------------- */
-const TILE_VALUES = [[0,0],[1,2],[2,3],[2,4],[1,5],[5,5],[3,6],[0,1],[2,2],[3,3],
-  [3,4],[2,5],[0,6],[4,6],[1,1],[0,3],[0,4],[4,4],[3,5],[1,6],
-  [5,6],[0,2],[1,3],[1,4],[0,5],[4,5],[2,6],[6,6]];
-function shuffle(a){ for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];} return a; }
-function dealRound(){
-  const deck = shuffle([...Array(28).keys()]);
-  const handA = deck.slice(0,7), handB = deck.slice(7,14);
-  let starterSeat=0,bestDbl=-1,bestSum=-1;
-  const scan=(h,s)=>{for(const v of h){const t=TILE_VALUES[v];if(t[0]===t[1]&&t[0]>bestDbl){bestDbl=t[0];starterSeat=s;}}};
-  scan(handA,0);scan(handB,1);
-  if(bestDbl<0){const s2=(h,s)=>{for(const v of h){const t=TILE_VALUES[v];if(t[0]+t[1]>bestSum){bestSum=t[0]+t[1];starterSeat=s;}}};s2(handA,0);s2(handB,1);}
-  return { handA, handB, starterSeat };
+/* =========================================================
+   USDT WALLET
+========================================================= */
+
+const USDT_NETWORKS = new Set([
+  'TRC20',
+  'BEP20',
+  'ERC20'
+]);
+
+const USDT_ADDRESSES = {
+  TRC20:
+    process.env.USDT_TRC20_ADDRESS || '',
+
+  BEP20:
+    process.env.USDT_BEP20_ADDRESS || '',
+
+  ERC20:
+    process.env.USDT_ERC20_ADDRESS || ''
+};
+
+const MIN_WITHDRAW =
+  Number(process.env.USDT_MIN_WITHDRAW || 10);
+
+const MAX_WITHDRAW =
+  Number(process.env.USDT_MAX_WITHDRAW || 10000);
+
+const WITHDRAW_FEE =
+  Number(process.env.USDT_WITHDRAW_FEE || 0);
+
+const ADMIN_TOKEN =
+  process.env.ADMIN_TOKEN || '';
+
+/* Validate USDT address */
+
+function validUsdtAddress(
+  network,
+  address
+) {
+  address = String(address || '').trim();
+
+  if (network === 'TRC20') {
+    return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(
+      address
+    );
+  }
+
+  if (
+    network === 'BEP20' ||
+    network === 'ERC20'
+  ) {
+    return /^0x[a-fA-F0-9]{40}$/.test(
+      address
+    );
+  }
+
+  return false;
 }
-let waiting=null; const rooms=new Map(); const socketRoom=new Map(); let seq=1;
-const other=(room,sid)=> room.players[0]===sid ? room.players[1] : room.players[0];
-function startRound(room){
-  const d=dealRound();
-  io.to(room.players[0]).emit('online_start',{seat:0,yourHand:d.handA,oppHand:d.handB,starterSeat:d.starterSeat,goal:room.goal});
-  io.to(room.players[1]).emit('online_start',{seat:1,yourHand:d.handB,oppHand:d.handA,starterSeat:d.starterSeat,goal:room.goal});
+
+/* Create wallet tables */
+
+async function initWalletTables() {
+
+  await db.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS
+      wallet_locked
+      NUMERIC(20,8)
+      NOT NULL
+      DEFAULT 0
+  `);
+
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS
+      wallet_transactions (
+        id BIGSERIAL PRIMARY KEY,
+
+        user_id INTEGER NOT NULL
+          REFERENCES users(id)
+          ON DELETE CASCADE,
+
+        type VARCHAR(16) NOT NULL
+          CHECK (
+            type IN (
+              'deposit',
+              'withdraw'
+            )
+          ),
+
+        network VARCHAR(10) NOT NULL,
+
+        amount NUMERIC(20,8)
+          NOT NULL
+          CHECK (amount >= 0),
+
+        address TEXT,
+
+        tx_hash TEXT,
+
+        status VARCHAR(20)
+          NOT NULL
+          DEFAULT 'pending',
+
+        fee NUMERIC(20,8)
+          NOT NULL
+          DEFAULT 0,
+
+        created_at TIMESTAMPTZ
+          NOT NULL
+          DEFAULT NOW(),
+
+        updated_at TIMESTAMPTZ
+          NOT NULL
+          DEFAULT NOW()
+      )
+  `);
+
+  await db.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS
+      wallet_deposit_tx_unique
+    ON wallet_transactions(tx_hash)
+    WHERE tx_hash IS NOT NULL
+  `);
+
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS
+      wallet_user_idx
+    ON wallet_transactions(
+      user_id,
+      created_at DESC
+    )
+  `);
 }
-io.on('connection', socket => {
-  socket.on('find_match', (opts={}) => {
-    const goal=[100,200,500].includes(opts.goal)?opts.goal:100;
-    if (waiting && waiting.socket.connected && waiting.socket.id!==socket.id){
-      const p1=waiting.socket,p2=socket; waiting=null;
-      const roomId='r'+(seq++); const room={players:[p1.id,p2.id],goal};
-      rooms.set(roomId,room); socketRoom.set(p1.id,roomId); socketRoom.set(p2.id,roomId);
-      p1.join(roomId); p2.join(roomId);
-      io.to(p1.id).emit('matched',{seat:0,goal}); io.to(p2.id).emit('matched',{seat:1,goal});
-      startRound(room);
-    } else { waiting={socket,goal}; socket.emit('waiting'); }
-  });
-  socket.on('game_move', (msg) => { const r=socketRoom.get(socket.id); if(!r)return; const room=rooms.get(r); if(!room)return; io.to(other(room,socket.id)).emit('game_move',msg); });
-  socket.on('next_round', () => { const r=socketRoom.get(socket.id); if(!r)return; const room=rooms.get(r); if(!room)return; startRound(room); });
-  socket.on('cancel_find', () => { if(waiting && waiting.socket.id===socket.id) waiting=null; });
-  socket.on('disconnect', () => {
-    if (waiting && waiting.socket.id===socket.id) waiting=null;
-    const r=socketRoom.get(socket.id);
-    if (r && rooms.has(r)){ const room=rooms.get(r); const o=other(room,socket.id); if(o) io.to(o).emit('opponent_left'); room.players.forEach(s=>socketRoom.delete(s)); rooms.delete(r); }
-  });
+
+/* Get wallet */
+
+app.get('/api/wallet', auth, async (req, res) => {
+  try {
+
+    const result = await db.query(
+      `
+      SELECT
+        balance,
+        wallet_locked
+      FROM users
+      WHERE id=$1
+      `,
+      [req.user.id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        error: 'not_found'
+      });
+    }
+
+    const user = result.rows[0];
+
+    const balance =
+      Number(user.balance || 0);
+
+    const locked =
+      Number(user.wallet_locked || 0);
+
+    res.json({
+      balance,
+
+      locked_balance: locked,
+
+      available_balance:
+        Math.max(
+          0,
+          balance
+        ),
+
+      currency: 'USDT',
+
+      deposit_addresses:
+        USDT_ADDRESSES,
+
+      networks:
+        Array.from(
+          USDT_NETWORKS
+        ),
+
+      min_withdraw:
+        MIN_WITHDRAW,
+
+      max_withdraw:
+        MAX_WITHDRAW,
+
+      withdraw_fee:
+        WITHDRAW_FEE
+    });
+
+  } catch (e) {
+
+    console.error(
+      'wallet get error:',
+      e.message
+    );
+
+    res.status(500).json({
+      error: 'server_error'
+    });
+  }
 });
 
-const PORT = process.env.PORT || 3000;
-db.init().catch(e => console.error('DB init failed:', e.message)).finally(() => {
-  server.listen(PORT, () => console.log('Domino server (v4) on port ' + PORT));
+/* =========================================================
+   DEPOSIT
+========================================================= */
+
+/*
+ * Deposit only submits a transaction hash.
+ *
+ * It DOES NOT automatically add money to balance.
+ * The transaction must be verified first.
+ */
+
+app.post('/api/deposit', auth, async (req, res) => {
+  try {
+
+    const network =
+      String(
+        req.body &&
+        req.body.network ||
+        ''
+      ).toUpperCase();
+
+    const txHash =
+      String(
+        req.body &&
+        req.body.tx_hash ||
+        ''
+      ).trim();
+
+    if (!USDT_NETWORKS.has(network)) {
+      return res.status(400).json({
+        error: 'invalid_network'
+      });
+    }
+
+    if (
+      !txHash ||
+      txHash.length < 20 ||
+      txHash.length > 200
+    ) {
+      return res.status(400).json({
+        error: 'invalid_tx_hash'
+      });
+    }
+
+    const exists = await db.query(
+      `
+      SELECT id
+      FROM wallet_transactions
+      WHERE tx_hash=$1
+      `,
+      [txHash]
+    );
+
+    if (exists.rows.length) {
+      return res.status(409).json({
+        error:
+          'tx_hash_already_submitted'
+      });
+    }
+
+    const result = await db.query(
+      `
+      INSERT INTO wallet_transactions
+        (
+          user_id,
+          type,
+          network,
+          amount,
+          tx_hash,
+          status
+        )
+      VALUES
+        (
+          $1,
+          'deposit',
+          $2,
+          0,
+          $3,
+          'pending'
+        )
+      RETURNING
+        id,
+        type,
+        network,
+        amount,
+        tx_hash,
+        status,
+        created_at
+      `,
+      [
+        req.user.id,
+        network,
+        txHash
+      ]
+    );
+
+    res.json({
+      ok: true,
+
+      transaction:
+        result.rows[0],
+
+      message:
+        'deposit_submitted_for_review'
+    });
+
+  } catch (e) {
+
+    console.error(
+      'deposit error:',
+      e.message
+    );
+
+    res.status(500).json({
+      error: 'server_error'
+    });
+  }
 });
+
+/* =========================================================
+   WITHDRAW
+========================================================= */
+
+app.post('/api/withdraw', auth, async (req, res) => {
+  try {
+
+    const network =
+      String(
+        req.body &&
+        req.body.network ||
+        ''
+      ).toUpperCase();
+
+    const address =
+      String(
+        req.body &&
+        req.body.address ||
+        ''
+      ).trim();
+
+    const amount =
+      Number(
+        req.body &&
+        req.body.amount
+      );
+
+    if (!USDT_NETWORKS.has(network)) {
+      return res.status(400).json({
+        error: 'invalid_network'
+      });
+    }
+
+    if (
+      !validUsdtAddress(
+        network,
+        address
+      )
+    ) {
+      return res.status(400).json({
+        error:
+          'invalid_address_for_network'
+      });
+    }
+
+    if (
+      !Number.isFinite(amount) ||
+      amount < MIN_WITHDRAW ||
+      amount > MAX_WITHDRAW
+    ) {
+      return res.status(400).json({
+        error: 'invalid_amount',
+        min: MIN_WITHDRAW,
+        max: MAX_WITHDRAW
+      });
+    }
+
+    /*
+     * Reserve the balance.
+     */
+    const result = await db.query(
+      `
+      UPDATE users
+
+      SET
+        balance =
+          balance - $1,
+
+        wallet_locked =
+          wallet_locked + $1
+
+      WHERE
+        id=$2
+        AND balance >= $1
+
+      RETURNING
+        balance,
+        wallet_locked
+      `,
+      [
+        amount,
+        req.user.id
+      ]
+    );
+
+    if (!result.rows.length) {
+      return res.status(400).json({
+        error:
+          'insufficient_balance'
+      });
+    }
+
+    try {
+
+      const withdrawal =
+        await db.query(
+          `
+          INSERT INTO wallet_transactions
+            (
+              user_id,
+              type,
+              network,
+              amount,
+              address,
+              status,
+              fee
+            )
+          VALUES
+            (
+              $1,
+              'withdraw',
+              $2,
+              $3,
+              $4,
+              'pending',
+              $5
+            )
+          RETURNING
+            id,
+            type,
+            network,
+            amount,
+            address,
+            status,
+            fee,
+            created_at
+          `,
+          [
+            req.user.id,
+            network,
+            amount,
+            address,
+            WITHDRAW_FEE
+          ]
+        );
+
+      res.json({
+        ok: true,
+
+        transaction:
+          withdrawal.rows[0],
+
+        balance:
+          Number(
+            result.rows[0].balance
+          ),
+
+        locked_balance:
+          Number(
+            result.rows[0].wallet_locked
+          ),
+
+        message:
+          'withdrawal_submitted_for_review'
+      });
+
+    } catch (e) {
+
+      /*
+       * Roll back balance reservation
+       * if transaction creation fails.
+       */
+
+      await db.query(
+        `
+        UPDATE users
+        SET
+          balance =
+            balance + $1,
+
+          wallet_locked =
+            GREATEST(
+              0,
+              wallet_locked - $1
+            )
+
+        WHERE id=$2
+        `,
+        [
+          amount,
+          req.user.id
+        ]
+      );
+
+      throw e;
+    }
+
+  } catch (e) {
+
+    console.error(
+      'withdraw error:',
+      e.message
+    );
+
+    res.status(500).json({
+      error: 'server_error'
+    });
+  }
+});
+
+/* =========================================================
+   WALLET TRANSACTION HISTORY
+========================================================= */
+
+app.get(
+  '/api/wallet/transactions',
+  auth,
+  async (req, res) => {
+
+    try {
+
+      const result = await db.query(
+        `
+        SELECT
+          id,
+          type,
+          network,
+          amount,
+          address,
+          tx_hash,
+          status,
+          fee,
+          created_at,
+          updated_at
+
+        FROM wallet_transactions
+
+        WHERE user_id=$1
+
+        ORDER BY
+          created_at DESC
+
+        LIMIT 50
+        `,
+        [req.user.id]
+      );
+
+      res.json({
+        transactions:
+          result.rows
+      });
+
+    } catch (e) {
+
+      console.error(
+        'wallet history error:',
+        e.message
+      );
+
+      res.status(500).json({
+        error: 'server_error'
+      });
+    }
+  }
+);
+
+/* =========================================================
+   ADMIN
+========================================================= */
+
+function adminOnly(req, res, next) {
+
+  if (
+    !ADMIN_TOKEN ||
+    req.headers['x-admin-token'] !==
+      ADMIN_TOKEN
+  ) {
+    return res.status(403).json({
+      error: 'admin_forbidden'
+    });
+  }
+
+  next();
+}
+
+/* Get all wallet transactions */
+
+app.get(
+  '/api/admin/wallet/transactions',
+  adminOnly,
+  async (req, res) => {
+
+    try {
+
+      const result = await db.query(
+        `
+        SELECT
+          id,
+          user_id,
+          type,
+          network,
+          amount,
+          address,
+          tx_hash,
+          status,
+          fee,
+          created_at
+
+        FROM wallet_transactions
+
+        ORDER BY
+          created_at DESC
+
+        LIMIT 200
+        `
+      );
+
+      res.json({
+        transactions:
+          result.rows
+      });
+
+    } catch (e) {
+
+      res.status(500).json({
+        error: 'server_error'
+      });
+    }
+  }
+);
+
+/* Approve deposit */
+
+app.post(
+  '/api/admin/wallet/deposit/:id/approve',
+  adminOnly,
+  async (req, res) => {
+
+    try {
+
+      const result = await db.query(
+        `
+        SELECT *
+        FROM wallet_transactions
+
+        WHERE
+          id=$1
+          AND type='deposit'
+        `,
+        [req.params.id]
+      );
+
+      if (!result.rows.length) {
+        return res.status(404).json({
+          error: 'not_found'
+        });
+      }
+
+      const transaction =
+        result.rows[0];
+
+      if (
+        transaction.status !==
+        'pending'
+      ) {
+        return res.status(409).json({
+          error:
+            'already_processed'
+        });
+      }
+
+      const amount =
+        Number(
+          req.body &&
+          req.body.amount
+        );
+
+      if (
+        !Number.isFinite(amount) ||
+        amount <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            'verified_amount_required'
+        });
+      }
+
+      /*
+       * Add verified amount to
+       * user's USDT balance.
+       */
+
+      const updated =
+        await db.query(
+          `
+          UPDATE users
+          SET
+            balance =
+              balance + $1
+
+          WHERE id=$2
+
+          RETURNING balance
+          `,
+          [
+            amount,
+            transaction.user_id
+          ]
+        );
+
+      await db.query(
+        `
+        UPDATE wallet_transactions
+
+        SET
+          amount=$1,
+          status='confirmed',
+          updated_at=NOW()
+
+        WHERE id=$2
+        `,
+        [
+          amount,
+          transaction.id
+        ]
+      );
+
+      res.json({
+        ok: true,
+
+        balance:
+          Number(
+            updated.rows[0].balance
+          )
+      });
+
+    } catch (e) {
+
+      console.error(
+        'deposit approve error:',
+        e.message
+      );
+
+      res.status(500).json({
+        error: 'server_error'
+      });
+    }
+  }
+);
+
+/* Complete withdrawal */
+
+app.post(
+  '/api/admin/wallet/withdraw/:id/complete',
+  adminOnly,
+  async (req, res) => {
+
+    try {
+
+      const result = await db.query(
+        `
+        SELECT *
+        FROM wallet_transactions
+
+        WHERE
+          id=$1
+          AND type='withdraw'
+        `,
+        [req.params.id]
+      );
+
+      if (!result.rows.length) {
+        return res.status(404).json({
+          error: 'not_found'
+        });
+      }
+
+      const transaction =
+        result.rows[0];
+
+      if (
+        transaction.status !==
+        'pending'
+      ) {
+        return res.status(409).json({
+          error:
+            'already_processed'
+        });
+      }
+
+      /*
+       * The amount was already removed
+       * from spendable balance.
+       *
+       * Here we release the locked amount
+       * after the external payout is confirmed.
+       */
+
+      const updated =
+        await db.query(
+          `
+          UPDATE users
+
+          SET
+            wallet_locked =
+              GREATEST(
+                0,
+                wallet_locked - $1
+              )
+
+          WHERE id=$2
+
+          RETURNING
+            balance,
+            wallet_locked
+          `,
+          [
+            Number(
+              transaction.amount
+            ),
+            transaction.user_id
+          ]
+        );
+
+      await db.query(
+        `
+        UPDATE wallet_transactions
+
+        SET
+          status='completed',
+          updated_at=NOW()
+
+        WHERE id=$1
+        `,
+        [transaction.id]
+      );
+
+      res.json({
+        ok: true,
+
+        balance:
+          Number(
+            updated.rows[0].balance
+          ),
+
+        locked_balance:
+          Number(
+            updated.rows[0]
+              .wallet_locked
+          )
+      });
+
+    } catch (e) {
+
+      console.error(
+        'withdraw complete error:',
+        e.message
+      );
+
+      res.status(500).json({
+        error: 'server_error'
+      });
+    }
+  }
+);
+
+/* Reject withdrawal */
+
+app.post(
+  '/api/admin/wallet/withdraw/:id/reject',
+  adminOnly,
+  async (req, res) => {
+
+    try {
+
+      const result = await db.query(
+        `
+        SELECT *
+        FROM wallet_transactions
+
+        WHERE
+          id=$1
+          AND type='withdraw'
+        `,
+        [req.params.id]
+      );
+
+      if (!result.rows.length) {
+        return res.status(404).json({
+          error: 'not_found'
+        });
+      }
+
+      const transaction =
+        result.rows[0];
+
+      if (
+        transaction.status !==
+        'pending'
+      ) {
+        return res.status(409).json({
+          error:
+            'already_processed'
+        });
+      }
+
+      /*
+       * Return reserved balance
+       * to the user.
+       */
+
+      const updated =
+        await db.query(
+          `
+          UPDATE users
+
+          SET
+            balance =
+              balance + $1,
+
+            wallet_locked =
+              GREATEST(
+                0,
+                wallet_locked - $1
+              )
+
+          WHERE id=$2
+
+          RETURNING
+            balance,
+            wallet_locked
+          `,
+          [
+            Number(
+              transaction.amount
+            ),
+            transaction.user_id
+          ]
+        );
+
+      await db.query(
+        `
+        UPDATE wallet_transactions
+
+        SET
+          status='rejected',
+          updated_at=NOW()
+
+        WHERE id=$1
+        `,
+        [transaction.id]
+      );
+
+      res.json({
+        ok: true,
+
+        balance:
+          Number(
+            updated.rows[0].balance
+          ),
+
+        locked_balance:
+          Number(
+            updated.rows[0]
+              .wallet_locked
+          )
+      });
+
+    } catch (e) {
+
+      console.error(
+        'withdraw reject error:',
+        e.message
+      );
+
+      res.status(500).json({
+        error: 'server_error'
+      });
+    }
+  }
+);
+
+/* =========================================================
+   GAME RESULT
+========================================================= */
+
+app.post(
+  '/api/game-result',
+  auth,
+  async (req, res) => {
+
+    try {
+
+      const result =
+        req.body &&
+        req.body.result === 'win'
+          ? 'win'
+          : 'loss';
+
+      let entry =
+        parseInt(
+          req.body &&
+          req.body.entry,
+          10
+        );
+
+      if (
+        ![100, 200, 500]
+          .includes(entry)
+      ) {
+        entry = 100;
+      }
+
+      const resultUser =
+        await db.query(
+          'SELECT * FROM users WHERE id=$1',
+          [req.user.id]
+        );
+
+      if (!resultUser.rows.length) {
+        return res.status(404).json({
+          error: 'not_found'
+        });
+      }
+
+      const user =
+        resultUser.rows[0];
+
+      let coins =
+        Number(user.coins || 0);
+
+      let wins =
+        Number(user.wins || 0);
+
+      let losses =
+        Number(user.losses || 0);
+
+      if (result === 'win') {
+
+        coins += entry;
+        wins += 1;
+
+      } else {
+
+        coins =
+          Math.max(
+            0,
+            coins - entry
+          );
+
+        losses += 1;
+      }
+
+      const updated =
+        await db.query(
+          `
+          UPDATE users
+
+          SET
+            coins=$1,
+            wins=$2,
+            losses=$3
+
+          WHERE id=$4
+
+          RETURNING *
+          `,
+          [
+            coins,
+            wins,
+            losses,
+            req.user.id
+          ]
+        );
+
+      res.json({
+        user:
+          publicUser(
+            updated.rows[0]
+          )
+      });
+
+    } catch (e) {
+
+      console.error(
+        'game-result error:',
+        e.message
+      );
+
+      res.status(500).json({
+        error: 'server_error'
+      });
+    }
+  }
+);
+
+/* =========================================================
+   ONLINE DOMINO GAME
+========================================================= */
+
+const TILE_VALUES = [
+  [0,0],
+  [1,2],
+  [2,3],
+  [2,4],
+  [1,5],
+  [5,5],
+  [3,6],
+  [0,1],
+  [2,2],
+  [3,3],
+  [3,4],
+  [2,5],
+  [0,6],
+  [4,6],
+  [1,1],
+  [0,3],
+  [0,4],
+  [4,4],
+  [3,5],
+  [1,6],
+  [5,6],
+  [0,2],
+  [1,3],
+  [1,4],
+  [0,5],
+  [4,5],
+  [2,6],
+  [6,6]
+];
+
+function shuffle(array) {
+
+  for (
+    let i = array.length - 1;
+    i > 0;
+    i--
+  ) {
+
+    const j =
+      Math.floor(
+        Math.random() *
+        (i + 1)
+      );
+
+    [
+      array[i],
+      array[j]
+    ] = [
+      array[j],
+      array[i]
+    ];
+  }
+
+  return array;
+}
+
+function dealRound() {
+
+  const deck =
+    shuffle([
+      ...Array(28).keys()
+    ]);
+
+  const handA =
+    deck.slice(0, 7);
+
+  const handB =
+    deck.slice(7, 14);
+
+  let starterSeat = 0;
+
+  let bestDbl = -1;
+  let bestSum = -1;
+
+  const scan =
+    (hand, seat) => {
+
+      for (
+        const value of hand
+      ) {
+
+        const tile =
+          TILE_VALUES[value];
+
+        if (
+          tile[0] === tile[1] &&
+          tile[0] > bestDbl
+        ) {
+          bestDbl =
+            tile[0];
+
+          starterSeat =
+            seat;
+        }
+      }
+    };
+
+  scan(handA, 0);
+  scan(handB, 1);
+
+  if (bestDbl < 0) {
+
+    const scanSum =
+      (hand, seat) => {
+
+        for (
+          const value of hand
+        ) {
+
+          const tile =
+            TILE_VALUES[value];
+
+          const sum =
+            tile[0] +
+            tile[1];
+
+          if (sum > bestSum) {
+
+            bestSum = sum;
+
+            starterSeat =
+              seat;
+          }
+        }
+      };
+
+    scanSum(handA, 0);
+    scanSum(handB, 1);
+  }
+
+  return {
+    handA,
+    handB,
+    starterSeat
+  };
+}
+
+/* Matchmaking */
+
+let waiting = null;
+
+const rooms =
+  new Map();
+
+const socketRoom =
+  new Map();
+
+let sequence = 1;
+
+function otherPlayer(
+  room,
+  socketId
+) {
+
+  return room.players[0] === socketId
+    ? room.players[1]
+    : room.players[0];
+}
+
+function startRound(room) {
+
+  const round =
+    dealRound();
+
+  io.to(
+    room.players[0]
+  ).emit(
+    'online_start',
+    {
+      seat: 0,
+
+      yourHand:
+        round.handA,
+
+      oppHand:
+        round.handB,
+
+      starterSeat:
+        round.starterSeat,
+
+      goal:
+        room.goal
+    }
+  );
+
+  io.to(
+    room.players[1]
+  ).emit(
+    'online_start',
+    {
+      seat: 1,
+
+      yourHand:
+        round.handB,
+
+      oppHand:
+        round.handA,
+
+      starterSeat:
+        round.starterSeat,
+
+      goal:
+        room.goal
+    }
+  );
+}
+
+/* Socket connection */
+
+io.on(
+  'connection',
+  socket => {
+
+    /* Find opponent */
+
+    socket.on(
+      'find_match',
+      (options = {}) => {
+
+        const goal =
+          [100, 200, 500]
+            .includes(
+              options.goal
+            )
+            ? options.goal
+            : 100;
+
+        const player = {
+          name:
+            String(
+              options.name ||
+              'Player'
+            ).slice(0, 24),
+
+          avatar:
+            String(
+              options.avatar ||
+              ''
+            ).slice(0, 8)
+        };
+
+        if (
+          waiting &&
+          waiting.socket.connected &&
+          waiting.socket.id !==
+            socket.id
+        ) {
+
+          const p1 =
+            waiting.socket;
+
+          const p1info =
+            waiting.info || {
+              name: 'Player',
+              avatar: ''
+            };
+
+          const p2 =
+            socket;
+
+          const p2info =
+            player;
+
+          waiting = null;
+
+          const roomId =
+            'r' +
+            sequence++;
+
+          const room = {
+            players: [
+              p1.id,
+              p2.id
+            ],
+
+            goal
+          };
+
+          rooms.set(
+            roomId,
+            room
+          );
+
+          socketRoom.set(
+            p1.id,
+            roomId
+          );
+
+          socketRoom.set(
+            p2.id,
+            roomId
+          );
+
+          p1.join(roomId);
+          p2.join(roomId);
+
+          io.to(p1.id).emit(
+            'matched',
+            {
+              seat: 0,
+              goal,
+              opp: p2info
+            }
+          );
+
+          io.to(p2.id).emit(
+            'matched',
+            {
+              seat: 1,
+              goal,
+              opp: p1info
+            }
+          );
+
+          startRound(room);
+
+        } else {
+
+          waiting = {
+            socket,
+            goal,
+            info: player
+          };
+
+          socket.emit(
+            'waiting'
+          );
+        }
+      }
+    );
+
+    /* Game move relay */
+
+    socket.on(
+      'game_move',
+      message => {
+
+        const roomId =
+          socketRoom.get(
+            socket.id
+          );
+
+        if (!roomId) {
+          return;
+        }
+
+        const room =
+          rooms.get(roomId);
+
+        if (!room) {
+          return;
+        }
+
+        const opponent =
+          otherPlayer(
+            room,
+            socket.id
+          );
+
+        io.to(
+          opponent
+        ).emit(
+          'game_move',
+          message
+        );
+      }
+    );
+
+    /* Next round */
+
+    socket.on(
+      'next_round',
+      () => {
+
+        const roomId =
+          socketRoom.get(
+            socket.id
+          );
+
+        if (!roomId) {
+          return;
+        }
+
+        const room =
+          rooms.get(roomId);
+
+        if (!room) {
+          return;
+        }
+
+        startRound(room);
+      }
+    );
+
+    /* Cancel matchmaking */
+
+    socket.on(
+      'cancel_find',
+      () => {
+
+        if (
+          waiting &&
+          waiting.socket.id ===
+            socket.id
+        ) {
+          waiting = null;
+        }
+      }
+    );
+
+    /* Disconnect */
+
+    socket.on(
+      'disconnect',
+      () => {
+
+        if (
+          waiting &&
+          waiting.socket.id ===
+            socket.id
+        ) {
+          waiting = null;
+        }
+
+        const roomId =
+          socketRoom.get(
+            socket.id
+          );
+
+        if (
+          roomId &&
+          rooms.has(roomId)
+        ) {
+
+          const room =
+            rooms.get(roomId);
+
+          const opponent =
+            otherPlayer(
+              room,
+              socket.id
+            );
+
+          if (opponent) {
+
+            io.to(
+              opponent
+            ).emit(
+              'opponent_left'
+            );
+          }
+
+          room.players.forEach(
+            id => {
+              socketRoom.delete(id);
+            }
+          );
+
+          rooms.delete(
+            roomId
+          );
+        }
+      }
+    );
+  }
+);
+
+/* =========================================================
+   START SERVER
+========================================================= */
+
+const PORT =
+  process.env.PORT || 3000;
+
+async function startServer() {
+
+  try {
+
+    await db.init();
+
+    await initWalletTables();
+
+    server.listen(
+      PORT,
+      () => {
+        console.log(
+          'Domino server running on port ' +
+          PORT
+        );
+      }
+    );
+
+  } catch (error) {
+
+    console.error(
+      'DB/server startup failed:',
+      error
+    );
+
+    process.exit(1);
+  }
+}
+
+startServer();
