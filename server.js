@@ -1106,6 +1106,10 @@ const USDT_ADDRESSES = {
     ''
 };
 
+const MIN_DEPOSIT =
+  Number(
+    process.env.USDT_MIN_DEPOSIT || 15
+  );
 const MIN_WITHDRAW =
   Number(
     process.env
@@ -1423,7 +1427,7 @@ app.post(
 
       if (
         !Number.isFinite(amount) ||
-        amount <= 0
+        amount < MIN_DEPOSIT
       ) {
         return res
           .status(400)
