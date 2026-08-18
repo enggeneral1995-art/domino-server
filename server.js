@@ -1108,8 +1108,11 @@ const USDT_ADDRESSES = {
 
 const MIN_DEPOSIT =
   Number(
-    process.env.USDT_MIN_DEPOSIT || 15
+    process.env
+      .USDT_MIN_DEPOSIT ||
+    15
   );
+
 const MIN_WITHDRAW =
   Number(
     process.env
@@ -1377,6 +1380,9 @@ app.get(
             USDT_NETWORKS
           ),
 
+        min_deposit:
+          MIN_DEPOSIT,
+
         min_withdraw:
           MIN_WITHDRAW,
 
@@ -1433,7 +1439,10 @@ app.post(
           .status(400)
           .json({
             error:
-              'invalid_amount'
+              'minimum_deposit_is_15_usdt',
+
+            min:
+              MIN_DEPOSIT
           });
       }
 
