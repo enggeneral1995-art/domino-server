@@ -1,6 +1,7 @@
 /*
  * Domino Block Online Server
  * Auth + Profile + USDT Wallet + Free/Paid 1v1 matchmaking
+ * + Online Draw / Boneyard
  */
 
 const express = require('express');
@@ -11,21 +12,31 @@ const jwt = require('jsonwebtoken');
 const db = require('./db');
 
 const JWT_SECRET =
-  process.env.JWT_SECRET || 'change_this_secret_in_railway';
+  process.env.JWT_SECRET ||
+  'change_this_secret_in_railway';
 
 const ADMIN_TOKEN =
   process.env.ADMIN_TOKEN || '';
 
 const app = express();
 
-app.use(express.json({ limit: '1mb' }));
+app.use(
+  express.json({
+    limit: '1mb'
+  })
+);
 
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
+  res.header(
+    'Access-Control-Allow-Origin',
+    '*'
+  );
+
   res.header(
     'Access-Control-Allow-Headers',
     'Content-Type, Authorization, X-Admin-Token'
   );
+
   res.header(
     'Access-Control-Allow-Methods',
     'GET, POST, OPTIONS'
@@ -38,11 +49,15 @@ app.use((req, res, next) => {
   next();
 });
 
-const server = http.createServer(app);
+const server =
+  http.createServer(app);
 
-const io = new Server(server, {
-  cors: { origin: '*' }
-});
+const io =
+  new Server(server, {
+    cors: {
+      origin: '*'
+    }
+  });
 
 /* =========================================================
    PASSWORD / AUTH
@@ -50,33 +65,64 @@ const io = new Server(server, {
 
 function hashPassword(password) {
   const salt =
-    crypto.randomBytes(16).toString('hex');
+    crypto
+      .randomBytes(16)
+      .toString('hex');
 
   const derived =
     crypto
-      .scryptSync(password, salt, 64)
+      .scryptSync(
+        password,
+        salt,
+        64
+      )
       .toString('hex');
 
-  return salt + ':' + derived;
+  return (
+    salt +
+    ':' +
+    derived
+  );
 }
 
-function verifyPassword(password, stored) {
+function verifyPassword(
+  password,
+  stored
+) {
   try {
     const [salt, key] =
-      String(stored).split(':');
+      String(stored)
+        .split(':');
 
     const derived =
       crypto
-        .scryptSync(password, salt, 64)
+        .scryptSync(
+          password,
+          salt,
+          64
+        )
         .toString('hex');
 
-    const a = Buffer.from(key, 'hex');
-    const b = Buffer.from(derived, 'hex');
+    const a =
+      Buffer.from(
+        key,
+        'hex'
+      );
+
+    const b =
+      Buffer.from(
+        derived,
+        'hex'
+      );
 
     return (
       a.length === b.length &&
-      crypto.timingSafeEqual(a, b)
+      crypto.timingSafeEqual(
+        a,
+        b
+      )
     );
+
   } catch {
     return false;
   }
@@ -96,7 +142,9 @@ function makeToken(user) {
 }
 
 function verifyMatchToken(token) {
-  if (!token) return null;
+  if (!token) {
+    return null;
+  }
 
   try {
     return jwt.verify(
@@ -111,19 +159,30 @@ function verifyMatchToken(token) {
 function defaultName(user) {
   return (
     user.username ||
-    String(user.email || 'player')
-      .split('@')[0]
+    String(
+      user.email ||
+      'player'
+    ).split('@')[0]
   );
 }
 
 function publicUser(user) {
   return {
-    id: user.id,
-    email: user.email,
-    phone: user.phone || null,
+    id:
+      user.id,
+
+    email:
+      user.email,
+
+    phone:
+      user.phone ||
+      null,
 
     balance:
-      Number(user.balance || 0),
+      Number(
+        user.balance ||
+        0
+      ),
 
     coins:
       Number(
@@ -136,29 +195,46 @@ function publicUser(user) {
       defaultName(user),
 
     wins:
-      Number(user.wins || 0),
+      Number(
+        user.wins ||
+        0
+      ),
 
     losses:
-      Number(user.losses || 0),
+      Number(
+        user.losses ||
+        0
+      ),
 
     avatar:
-      user.avatar || null
+      user.avatar ||
+      null
   };
 }
 
-function auth(req, res, next) {
+function auth(
+  req,
+  res,
+  next
+) {
   const header =
-    req.headers.authorization || '';
+    req.headers.authorization ||
+    '';
 
   const token =
-    header.startsWith('Bearer ')
+    header.startsWith(
+      'Bearer '
+    )
       ? header.slice(7)
       : null;
 
   if (!token) {
-    return res.status(401).json({
-      error: 'no_token'
-    });
+    return res
+      .status(401)
+      .json({
+        error:
+          'no_token'
+      });
   }
 
   try {
@@ -171,21 +247,32 @@ function auth(req, res, next) {
     next();
 
   } catch {
-    return res.status(401).json({
-      error: 'bad_token'
-    });
+    return res
+      .status(401)
+      .json({
+        error:
+          'bad_token'
+      });
   }
 }
 
-function adminOnly(req, res, next) {
+function adminOnly(
+  req,
+  res,
+  next
+) {
   if (
     !ADMIN_TOKEN ||
-    req.headers['x-admin-token'] !==
-      ADMIN_TOKEN
+    req.headers[
+      'x-admin-token'
+    ] !== ADMIN_TOKEN
   ) {
-    return res.status(403).json({
-      error: 'admin_forbidden'
-    });
+    return res
+      .status(403)
+      .json({
+        error:
+          'admin_forbidden'
+      });
   }
 
   next();
@@ -195,195 +282,291 @@ function adminOnly(req, res, next) {
    HEALTH
 ========================================================= */
 
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'Domino Block',
-    version: 'v7-paid-match-escrow'
-  });
-});
+app.get(
+  '/',
+  (_req, res) => {
+    res.json({
+      ok: true,
+
+      service:
+        'Domino Block',
+
+      version:
+        'v8-paid-draw'
+    });
+  }
+);
 
 /* =========================================================
    REGISTER
 ========================================================= */
 
-app.post('/api/register', async (req, res) => {
-  try {
-    let {
-      email,
-      phone,
-      password
-    } = req.body || {};
+app.post(
+  '/api/register',
+  async (req, res) => {
+    try {
+      let {
+        email,
+        phone,
+        password
+      } =
+        req.body || {};
 
-    if (!email || !password) {
-      return res.status(400).json({
-        error:
-          'email_and_password_required'
+      if (
+        !email ||
+        !password
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'email_and_password_required'
+          });
+      }
+
+      email =
+        String(email)
+          .trim()
+          .toLowerCase();
+
+      if (
+        String(password)
+          .length < 6
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'password_too_short'
+          });
+      }
+
+      const exists =
+        await db.query(
+          `
+          SELECT id
+
+          FROM users
+
+          WHERE email=$1
+          `,
+          [email]
+        );
+
+      if (
+        exists.rows.length
+      ) {
+        return res
+          .status(409)
+          .json({
+            error:
+              'email_already_used'
+          });
+      }
+
+      const result =
+        await db.query(
+          `
+          INSERT INTO users
+          (
+            email,
+            phone,
+            password_hash
+          )
+
+          VALUES
+          (
+            $1,
+            $2,
+            $3
+          )
+
+          RETURNING *
+          `,
+          [
+            email,
+            phone || null,
+            hashPassword(
+              password
+            )
+          ]
+        );
+
+      const user =
+        result.rows[0];
+
+      res.json({
+        token:
+          makeToken(user),
+
+        user:
+          publicUser(user)
       });
-    }
 
-    email =
-      String(email)
-        .trim()
-        .toLowerCase();
-
-    if (
-      String(password).length < 6
-    ) {
-      return res.status(400).json({
-        error:
-          'password_too_short'
-      });
-    }
-
-    const exists =
-      await db.query(
-        'SELECT id FROM users WHERE email=$1',
-        [email]
+    } catch (e) {
+      console.error(
+        'register error:',
+        e.message
       );
 
-    if (exists.rows.length) {
-      return res.status(409).json({
-        error:
-          'email_already_used'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
-
-    const result =
-      await db.query(
-        `
-        INSERT INTO users
-        (
-          email,
-          phone,
-          password_hash
-        )
-        VALUES
-        (
-          $1,
-          $2,
-          $3
-        )
-        RETURNING *
-        `,
-        [
-          email,
-          phone || null,
-          hashPassword(password)
-        ]
-      );
-
-    res.json({
-      token:
-        makeToken(result.rows[0]),
-
-      user:
-        publicUser(result.rows[0])
-    });
-
-  } catch (e) {
-    console.error(
-      'register error:',
-      e.message
-    );
-
-    res.status(500).json({
-      error: 'server_error'
-    });
   }
-});
+);
 
 /* =========================================================
    LOGIN
 ========================================================= */
 
-app.post('/api/login', async (req, res) => {
-  try {
-    let {
-      email,
-      password
-    } = req.body || {};
+app.post(
+  '/api/login',
+  async (req, res) => {
+    try {
+      let {
+        email,
+        password
+      } =
+        req.body || {};
 
-    if (!email || !password) {
-      return res.status(400).json({
-        error:
-          'email_and_password_required'
+      if (
+        !email ||
+        !password
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'email_and_password_required'
+          });
+      }
+
+      email =
+        String(email)
+          .trim()
+          .toLowerCase();
+
+      const result =
+        await db.query(
+          `
+          SELECT *
+
+          FROM users
+
+          WHERE email=$1
+          `,
+          [email]
+        );
+
+      if (
+        !result.rows.length
+      ) {
+        return res
+          .status(401)
+          .json({
+            error:
+              'invalid_credentials'
+          });
+      }
+
+      const user =
+        result.rows[0];
+
+      if (
+        !verifyPassword(
+          password,
+          user.password_hash
+        )
+      ) {
+        return res
+          .status(401)
+          .json({
+            error:
+              'invalid_credentials'
+          });
+      }
+
+      res.json({
+        token:
+          makeToken(user),
+
+        user:
+          publicUser(user)
       });
-    }
 
-    email =
-      String(email)
-        .trim()
-        .toLowerCase();
-
-    const result =
-      await db.query(
-        'SELECT * FROM users WHERE email=$1',
-        [email]
+    } catch (e) {
+      console.error(
+        'login error:',
+        e.message
       );
 
-    if (
-      !result.rows.length ||
-      !verifyPassword(
-        password,
-        result.rows[0].password_hash
-      )
-    ) {
-      return res.status(401).json({
-        error:
-          'invalid_credentials'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
-
-    res.json({
-      token:
-        makeToken(result.rows[0]),
-
-      user:
-        publicUser(result.rows[0])
-    });
-
-  } catch (e) {
-    console.error(
-      'login error:',
-      e.message
-    );
-
-    res.status(500).json({
-      error: 'server_error'
-    });
   }
-});
+);
 
 /* =========================================================
-   ME / PROFILE
+   CURRENT USER
 ========================================================= */
 
-app.get('/api/me', auth, async (req, res) => {
-  try {
-    const result =
-      await db.query(
-        'SELECT * FROM users WHERE id=$1',
-        [req.user.id]
-      );
+app.get(
+  '/api/me',
+  auth,
+  async (req, res) => {
+    try {
+      const result =
+        await db.query(
+          `
+          SELECT *
 
-    if (!result.rows.length) {
-      return res.status(404).json({
-        error: 'not_found'
+          FROM users
+
+          WHERE id=$1
+          `,
+          [req.user.id]
+        );
+
+      if (
+        !result.rows.length
+      ) {
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
+      }
+
+      res.json({
+        user:
+          publicUser(
+            result.rows[0]
+          )
       });
+
+    } catch {
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
-
-    res.json({
-      user:
-        publicUser(result.rows[0])
-    });
-
-  } catch {
-    res.status(500).json({
-      error: 'server_error'
-    });
   }
-});
+);
+
+/* =========================================================
+   PROFILE
+========================================================= */
 
 app.get(
   '/api/profile',
@@ -392,25 +575,41 @@ app.get(
     try {
       const result =
         await db.query(
-          'SELECT * FROM users WHERE id=$1',
+          `
+          SELECT *
+
+          FROM users
+
+          WHERE id=$1
+          `,
           [req.user.id]
         );
 
-      if (!result.rows.length) {
-        return res.status(404).json({
-          error: 'not_found'
-        });
+      if (
+        !result.rows.length
+      ) {
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
       }
 
       res.json({
         user:
-          publicUser(result.rows[0])
+          publicUser(
+            result.rows[0]
+          )
       });
 
     } catch {
-      res.status(500).json({
-        error: 'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
@@ -423,7 +622,8 @@ app.post(
       let {
         username,
         avatar
-      } = req.body || {};
+      } =
+        req.body || {};
 
       const sets = [];
       const values = [];
@@ -431,65 +631,90 @@ app.post(
       let index = 1;
 
       if (
-        username !== undefined &&
+        username !==
+          undefined &&
         username !== null
       ) {
         username =
-          String(username).trim();
+          String(username)
+            .trim();
 
         if (
           username.length < 2 ||
           username.length > 20
         ) {
-          return res.status(400).json({
-            error:
-              'username_length'
-          });
+          return res
+            .status(400)
+            .json({
+              error:
+                'username_length'
+            });
         }
 
         sets.push(
           `username=$${index++}`
         );
 
-        values.push(username);
+        values.push(
+          username
+        );
       }
 
       if (
-        avatar !== undefined &&
+        avatar !==
+          undefined &&
         avatar !== null
       ) {
         avatar =
-          String(avatar).trim();
+          String(avatar)
+            .trim();
 
-        if (avatar.length > 40) {
-          return res.status(400).json({
-            error:
-              'avatar_invalid'
-          });
+        if (
+          avatar.length > 40
+        ) {
+          return res
+            .status(400)
+            .json({
+              error:
+                'avatar_invalid'
+            });
         }
 
         sets.push(
           `avatar=$${index++}`
         );
 
-        values.push(avatar);
+        values.push(
+          avatar
+        );
       }
 
-      if (!sets.length) {
-        return res.status(400).json({
-          error:
-            'nothing_to_update'
-        });
+      if (
+        !sets.length
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'nothing_to_update'
+          });
       }
 
-      values.push(req.user.id);
+      values.push(
+        req.user.id
+      );
 
       const result =
         await db.query(
           `
           UPDATE users
-          SET ${sets.join(', ')}
-          WHERE id=$${index}
+
+          SET
+            ${sets.join(', ')}
+
+          WHERE
+            id=$${index}
+
           RETURNING *
           `,
           values
@@ -497,7 +722,9 @@ app.post(
 
       res.json({
         user:
-          publicUser(result.rows[0])
+          publicUser(
+            result.rows[0]
+          )
       });
 
     } catch (e) {
@@ -506,15 +733,18 @@ app.post(
         e.message
       );
 
-      res.status(500).json({
-        error: 'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
 
 /* =========================================================
-   USDT WALLET
+   WALLET CONFIG
 ========================================================= */
 
 const USDT_NETWORKS =
@@ -526,28 +756,40 @@ const USDT_NETWORKS =
 
 const USDT_ADDRESSES = {
   TRC20:
-    process.env.USDT_TRC20_ADDRESS || '',
+    process.env
+      .USDT_TRC20_ADDRESS ||
+    '',
 
   BEP20:
-    process.env.USDT_BEP20_ADDRESS || '',
+    process.env
+      .USDT_BEP20_ADDRESS ||
+    '',
 
   ERC20:
-    process.env.USDT_ERC20_ADDRESS || ''
+    process.env
+      .USDT_ERC20_ADDRESS ||
+    ''
 };
 
 const MIN_WITHDRAW =
   Number(
-    process.env.USDT_MIN_WITHDRAW || 10
+    process.env
+      .USDT_MIN_WITHDRAW ||
+    10
   );
 
 const MAX_WITHDRAW =
   Number(
-    process.env.USDT_MAX_WITHDRAW || 10000
+    process.env
+      .USDT_MAX_WITHDRAW ||
+    10000
   );
 
 const WITHDRAW_FEE =
   Number(
-    process.env.USDT_WITHDRAW_FEE || 0
+    process.env
+      .USDT_WITHDRAW_FEE ||
+    0
   );
 
 function validUsdtAddress(
@@ -555,33 +797,43 @@ function validUsdtAddress(
   address
 ) {
   address =
-    String(address || '').trim();
+    String(
+      address || ''
+    ).trim();
 
-  if (network === 'TRC20') {
-    return /^T[1-9A-HJ-NP-Za-km-z]{33}$/
-      .test(address);
+  if (
+    network === 'TRC20'
+  ) {
+    return (
+      /^T[1-9A-HJ-NP-Za-km-z]{33}$/
+        .test(address)
+    );
   }
 
   if (
     network === 'BEP20' ||
     network === 'ERC20'
   ) {
-    return /^0x[a-fA-F0-9]{40}$/
-      .test(address);
+    return (
+      /^0x[a-fA-F0-9]{40}$/
+        .test(address)
+    );
   }
 
   return false;
 }
 
 /* =========================================================
-   DATABASE TABLES
+   WALLET TABLES
 ========================================================= */
 
 async function initWalletTables() {
   await db.query(`
     ALTER TABLE users
+
     ADD COLUMN IF NOT EXISTS
-      wallet_locked NUMERIC(20,8)
+      wallet_locked
+      NUMERIC(20,8)
       NOT NULL
       DEFAULT 0
   `);
@@ -590,13 +842,19 @@ async function initWalletTables() {
     CREATE TABLE IF NOT EXISTS
       wallet_transactions
     (
-      id BIGSERIAL PRIMARY KEY,
+      id
+        BIGSERIAL
+        PRIMARY KEY,
 
-      user_id INTEGER NOT NULL
+      user_id
+        INTEGER
+        NOT NULL
         REFERENCES users(id)
         ON DELETE CASCADE,
 
-      type VARCHAR(16) NOT NULL
+      type
+        VARCHAR(16)
+        NOT NULL
         CHECK(
           type IN (
             'deposit',
@@ -604,29 +862,38 @@ async function initWalletTables() {
           )
         ),
 
-      network VARCHAR(10) NOT NULL,
+      network
+        VARCHAR(10)
+        NOT NULL,
 
-      amount NUMERIC(20,8)
+      amount
+        NUMERIC(20,8)
         NOT NULL
         CHECK(amount >= 0),
 
-      address TEXT,
+      address
+        TEXT,
 
-      tx_hash TEXT,
+      tx_hash
+        TEXT,
 
-      status VARCHAR(20)
+      status
+        VARCHAR(20)
         NOT NULL
         DEFAULT 'pending',
 
-      fee NUMERIC(20,8)
+      fee
+        NUMERIC(20,8)
         NOT NULL
         DEFAULT 0,
 
-      created_at TIMESTAMPTZ
+      created_at
+        TIMESTAMPTZ
         NOT NULL
         DEFAULT NOW(),
 
-      updated_at TIMESTAMPTZ
+      updated_at
+        TIMESTAMPTZ
         NOT NULL
         DEFAULT NOW()
     )
@@ -636,24 +903,29 @@ async function initWalletTables() {
     CREATE UNIQUE INDEX IF NOT EXISTS
       wallet_deposit_tx_unique
 
-    ON wallet_transactions(tx_hash)
+    ON
+      wallet_transactions(
+        tx_hash
+      )
 
-    WHERE tx_hash IS NOT NULL
+    WHERE
+      tx_hash IS NOT NULL
   `);
 
   await db.query(`
     CREATE INDEX IF NOT EXISTS
       wallet_user_idx
 
-    ON wallet_transactions(
-      user_id,
-      created_at DESC
-    )
+    ON
+      wallet_transactions(
+        user_id,
+        created_at DESC
+      )
   `);
 }
 
 /* =========================================================
-   WALLET
+   GET WALLET
 ========================================================= */
 
 app.get(
@@ -672,24 +944,34 @@ app.get(
 
           WHERE id=$1
           `,
-          [req.user.id]
+          [
+            req.user.id
+          ]
         );
 
-      if (!result.rows.length) {
-        return res.status(404).json({
-          error: 'not_found'
-        });
+      if (
+        !result.rows.length
+      ) {
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
       }
 
       const balance =
         Number(
-          result.rows[0].balance || 0
+          result.rows[0]
+            .balance ||
+          0
         );
 
       const locked =
         Number(
           result.rows[0]
-            .wallet_locked || 0
+            .wallet_locked ||
+          0
         );
 
       res.json({
@@ -731,9 +1013,12 @@ app.get(
         e.message
       );
 
-      res.status(500).json({
-        error: 'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
@@ -749,21 +1034,28 @@ app.post(
     try {
       const network =
         String(
-          req.body?.network || ''
+          req.body
+            ?.network ||
+          ''
         ).toUpperCase();
 
       const txHash =
         String(
-          req.body?.tx_hash || ''
+          req.body
+            ?.tx_hash ||
+          ''
         ).trim();
 
       if (
-        !USDT_NETWORKS.has(network)
+        !USDT_NETWORKS
+          .has(network)
       ) {
-        return res.status(400).json({
-          error:
-            'invalid_network'
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_network'
+          });
       }
 
       if (
@@ -771,16 +1063,19 @@ app.post(
         txHash.length < 20 ||
         txHash.length > 200
       ) {
-        return res.status(400).json({
-          error:
-            'invalid_tx_hash'
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_tx_hash'
+          });
       }
 
       const result =
         await db.query(
           `
-          INSERT INTO wallet_transactions
+          INSERT INTO
+            wallet_transactions
           (
             user_id,
             type,
@@ -827,11 +1122,16 @@ app.post(
       });
 
     } catch (e) {
-      if (e.code === '23505') {
-        return res.status(409).json({
-          error:
-            'tx_hash_already_submitted'
-        });
+      if (
+        e.code ===
+        '23505'
+      ) {
+        return res
+          .status(409)
+          .json({
+            error:
+              'tx_hash_already_submitted'
+          });
       }
 
       console.error(
@@ -839,9 +1139,12 @@ app.post(
         e.message
       );
 
-      res.status(500).json({
-        error: 'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
@@ -855,31 +1158,40 @@ app.post(
   auth,
   async (req, res) => {
     const client =
-      await db.pool.connect();
+      await db.pool
+        .connect();
 
     try {
       const network =
         String(
-          req.body?.network || ''
+          req.body
+            ?.network ||
+          ''
         ).toUpperCase();
 
       const address =
         String(
-          req.body?.address || ''
+          req.body
+            ?.address ||
+          ''
         ).trim();
 
       const amount =
         Number(
-          req.body?.amount
+          req.body
+            ?.amount
         );
 
       if (
-        !USDT_NETWORKS.has(network)
+        !USDT_NETWORKS
+          .has(network)
       ) {
-        return res.status(400).json({
-          error:
-            'invalid_network'
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_network'
+          });
       }
 
       if (
@@ -888,30 +1200,38 @@ app.post(
           address
         )
       ) {
-        return res.status(400).json({
-          error:
-            'invalid_address_for_network'
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_address_for_network'
+          });
       }
 
       if (
-        !Number.isFinite(amount) ||
-        amount < MIN_WITHDRAW ||
-        amount > MAX_WITHDRAW
+        !Number
+          .isFinite(amount) ||
+        amount <
+          MIN_WITHDRAW ||
+        amount >
+          MAX_WITHDRAW
       ) {
-        return res.status(400).json({
-          error:
-            'invalid_amount',
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_amount',
 
-          min:
-            MIN_WITHDRAW,
+            min:
+              MIN_WITHDRAW,
 
-          max:
-            MAX_WITHDRAW
-        });
+            max:
+              MAX_WITHDRAW
+          });
       }
 
-      await client.query('BEGIN');
+      await client
+        .query('BEGIN');
 
       const userResult =
         await client.query(
@@ -926,33 +1246,48 @@ app.post(
 
           FOR UPDATE
           `,
-          [req.user.id]
+          [
+            req.user.id
+          ]
         );
-
-      if (!userResult.rows.length) {
-        await client.query(
-          'ROLLBACK'
-        );
-
-        return res.status(404).json({
-          error: 'not_found'
-        });
-      }
 
       if (
-        Number(
-          userResult.rows[0]
-            .balance || 0
-        ) < amount
+        !userResult
+          .rows.length
       ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(400).json({
-          error:
-            'insufficient_balance'
-        });
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
+      }
+
+      const balance =
+        Number(
+          userResult
+            .rows[0]
+            .balance ||
+          0
+        );
+
+      if (
+        balance < amount
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res
+          .status(400)
+          .json({
+            error:
+              'insufficient_balance'
+          });
       }
 
       const updated =
@@ -982,7 +1317,8 @@ app.post(
       const withdrawal =
         await client.query(
           `
-          INSERT INTO wallet_transactions
+          INSERT INTO
+            wallet_transactions
           (
             user_id,
             type,
@@ -1035,12 +1371,15 @@ app.post(
 
         balance:
           Number(
-            updated.rows[0].balance
+            updated
+              .rows[0]
+              .balance
           ),
 
         locked_balance:
           Number(
-            updated.rows[0]
+            updated
+              .rows[0]
               .wallet_locked
           ),
 
@@ -1060,10 +1399,12 @@ app.post(
         e.message
       );
 
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
 
     } finally {
       client.release();
@@ -1095,16 +1436,20 @@ app.get(
             created_at,
             updated_at
 
-          FROM wallet_transactions
+          FROM
+            wallet_transactions
 
-          WHERE user_id=$1
+          WHERE
+            user_id=$1
 
           ORDER BY
             created_at DESC
 
           LIMIT 50
           `,
-          [req.user.id]
+          [
+            req.user.id
+          ]
         );
 
       res.json({
@@ -1113,16 +1458,18 @@ app.get(
       });
 
     } catch {
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
 
 /* =========================================================
-   WALLET ADMIN
+   ADMIN WALLET
 ========================================================= */
 
 app.get(
@@ -1146,7 +1493,8 @@ app.get(
             created_at,
             updated_at
 
-          FROM wallet_transactions
+          FROM
+            wallet_transactions
 
           ORDER BY
             created_at DESC
@@ -1161,35 +1509,46 @@ app.get(
       });
 
     } catch {
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
+
+/* =========================================================
+   APPROVE DEPOSIT
+========================================================= */
 
 app.post(
   '/api/admin/wallet/deposit/:id/approve',
   adminOnly,
   async (req, res) => {
     const client =
-      await db.pool.connect();
+      await db.pool
+        .connect();
 
     try {
       const amount =
         Number(
-          req.body?.amount
+          req.body
+            ?.amount
         );
 
       if (
-        !Number.isFinite(amount) ||
+        !Number
+          .isFinite(amount) ||
         amount <= 0
       ) {
-        return res.status(400).json({
-          error:
-            'verified_amount_required'
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              'verified_amount_required'
+          });
       }
 
       await client.query(
@@ -1201,39 +1560,51 @@ app.post(
           `
           SELECT *
 
-          FROM wallet_transactions
+          FROM
+            wallet_transactions
 
           WHERE
             id=$1
-            AND type='deposit'
+            AND
+            type='deposit'
 
           FOR UPDATE
           `,
-          [req.params.id]
+          [
+            req.params.id
+          ]
         );
 
-      if (!tx.rows.length) {
+      if (
+        !tx.rows.length
+      ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(404).json({
-          error: 'not_found'
-        });
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
       }
 
       if (
-        tx.rows[0].status !==
+        tx.rows[0]
+          .status !==
         'pending'
       ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(409).json({
-          error:
-            'already_processed'
-        });
+        return res
+          .status(409)
+          .json({
+            error:
+              'already_processed'
+          });
       }
 
       const updated =
@@ -1245,26 +1616,31 @@ app.post(
             balance =
               balance + $1
 
-          WHERE id=$2
+          WHERE
+            id=$2
 
-          RETURNING balance
+          RETURNING
+            balance
           `,
           [
             amount,
-            tx.rows[0].user_id
+            tx.rows[0]
+              .user_id
           ]
         );
 
       await client.query(
         `
-        UPDATE wallet_transactions
+        UPDATE
+          wallet_transactions
 
         SET
           amount=$1,
           status='confirmed',
           updated_at=NOW()
 
-        WHERE id=$2
+        WHERE
+          id=$2
         `,
         [
           amount,
@@ -1281,7 +1657,9 @@ app.post(
 
         balance:
           Number(
-            updated.rows[0].balance
+            updated
+              .rows[0]
+              .balance
           )
       });
 
@@ -1292,10 +1670,12 @@ app.post(
         );
       } catch {}
 
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
 
     } finally {
       client.release();
@@ -1303,12 +1683,17 @@ app.post(
   }
 );
 
+/* =========================================================
+   COMPLETE WITHDRAW
+========================================================= */
+
 app.post(
   '/api/admin/wallet/withdraw/:id/complete',
   adminOnly,
   async (req, res) => {
     const client =
-      await db.pool.connect();
+      await db.pool
+        .connect();
 
     try {
       await client.query(
@@ -1320,44 +1705,57 @@ app.post(
           `
           SELECT *
 
-          FROM wallet_transactions
+          FROM
+            wallet_transactions
 
           WHERE
             id=$1
-            AND type='withdraw'
+            AND
+            type='withdraw'
 
           FOR UPDATE
           `,
-          [req.params.id]
+          [
+            req.params.id
+          ]
         );
 
-      if (!tx.rows.length) {
+      if (
+        !tx.rows.length
+      ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(404).json({
-          error: 'not_found'
-        });
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
       }
 
       if (
-        tx.rows[0].status !==
+        tx.rows[0]
+          .status !==
         'pending'
       ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(409).json({
-          error:
-            'already_processed'
-        });
+        return res
+          .status(409)
+          .json({
+            error:
+              'already_processed'
+          });
       }
 
       const amount =
         Number(
-          tx.rows[0].amount
+          tx.rows[0]
+            .amount
         );
 
       const updated =
@@ -1372,7 +1770,8 @@ app.post(
                 wallet_locked - $1
               )
 
-          WHERE id=$2
+          WHERE
+            id=$2
 
           RETURNING
             balance,
@@ -1380,21 +1779,26 @@ app.post(
           `,
           [
             amount,
-            tx.rows[0].user_id
+            tx.rows[0]
+              .user_id
           ]
         );
 
       await client.query(
         `
-        UPDATE wallet_transactions
+        UPDATE
+          wallet_transactions
 
         SET
           status='completed',
           updated_at=NOW()
 
-        WHERE id=$1
+        WHERE
+          id=$1
         `,
-        [tx.rows[0].id]
+        [
+          tx.rows[0].id
+        ]
       );
 
       await client.query(
@@ -1406,12 +1810,15 @@ app.post(
 
         balance:
           Number(
-            updated.rows[0].balance
+            updated
+              .rows[0]
+              .balance
           ),
 
         locked_balance:
           Number(
-            updated.rows[0]
+            updated
+              .rows[0]
               .wallet_locked
           )
       });
@@ -1423,10 +1830,12 @@ app.post(
         );
       } catch {}
 
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
 
     } finally {
       client.release();
@@ -1434,12 +1843,17 @@ app.post(
   }
 );
 
+/* =========================================================
+   REJECT WITHDRAW
+========================================================= */
+
 app.post(
   '/api/admin/wallet/withdraw/:id/reject',
   adminOnly,
   async (req, res) => {
     const client =
-      await db.pool.connect();
+      await db.pool
+        .connect();
 
     try {
       await client.query(
@@ -1451,44 +1865,57 @@ app.post(
           `
           SELECT *
 
-          FROM wallet_transactions
+          FROM
+            wallet_transactions
 
           WHERE
             id=$1
-            AND type='withdraw'
+            AND
+            type='withdraw'
 
           FOR UPDATE
           `,
-          [req.params.id]
+          [
+            req.params.id
+          ]
         );
 
-      if (!tx.rows.length) {
+      if (
+        !tx.rows.length
+      ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(404).json({
-          error: 'not_found'
-        });
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
       }
 
       if (
-        tx.rows[0].status !==
+        tx.rows[0]
+          .status !==
         'pending'
       ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(409).json({
-          error:
-            'already_processed'
-        });
+        return res
+          .status(409)
+          .json({
+            error:
+              'already_processed'
+          });
       }
 
       const amount =
         Number(
-          tx.rows[0].amount
+          tx.rows[0]
+            .amount
         );
 
       const updated =
@@ -1506,7 +1933,8 @@ app.post(
                 wallet_locked - $1
               )
 
-          WHERE id=$2
+          WHERE
+            id=$2
 
           RETURNING
             balance,
@@ -1514,21 +1942,26 @@ app.post(
           `,
           [
             amount,
-            tx.rows[0].user_id
+            tx.rows[0]
+              .user_id
           ]
         );
 
       await client.query(
         `
-        UPDATE wallet_transactions
+        UPDATE
+          wallet_transactions
 
         SET
           status='rejected',
           updated_at=NOW()
 
-        WHERE id=$1
+        WHERE
+          id=$1
         `,
-        [tx.rows[0].id]
+        [
+          tx.rows[0].id
+        ]
       );
 
       await client.query(
@@ -1540,12 +1973,15 @@ app.post(
 
         balance:
           Number(
-            updated.rows[0].balance
+            updated
+              .rows[0]
+              .balance
           ),
 
         locked_balance:
           Number(
-            updated.rows[0]
+            updated
+              .rows[0]
               .wallet_locked
           )
       });
@@ -1557,10 +1993,12 @@ app.post(
         );
       } catch {}
 
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
 
     } finally {
       client.release();
@@ -1569,7 +2007,7 @@ app.post(
 );
 
 /* =========================================================
-   PAID MATCH
+   PAID MATCH CONFIG
 ========================================================= */
 
 const PAID_TIERS =
@@ -1579,49 +2017,67 @@ const PAID_TIERS =
     [5, 9.00]
   ]);
 
+/* =========================================================
+   PAID MATCH TABLE
+========================================================= */
+
 async function initPaidMatchTables() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS
       paid_matches
     (
-      id BIGSERIAL PRIMARY KEY,
+      id
+        BIGSERIAL
+        PRIMARY KEY,
 
-      room_id TEXT
+      room_id
+        TEXT
         UNIQUE
         NOT NULL,
 
-      p1_user_id INTEGER
+      p1_user_id
+        INTEGER
         NOT NULL
         REFERENCES users(id),
 
-      p2_user_id INTEGER
+      p2_user_id
+        INTEGER
         NOT NULL
         REFERENCES users(id),
 
-      stake NUMERIC(20,8)
+      stake
+        NUMERIC(20,8)
         NOT NULL,
 
-      prize NUMERIC(20,8)
+      prize
+        NUMERIC(20,8)
         NOT NULL,
 
-      status VARCHAR(20)
+      status
+        VARCHAR(20)
         NOT NULL
         DEFAULT 'active',
 
-      p1_report VARCHAR(8),
+      p1_report
+        VARCHAR(8),
 
-      p2_report VARCHAR(8),
+      p2_report
+        VARCHAR(8),
 
-      winner_user_id INTEGER
+      winner_user_id
+        INTEGER
         REFERENCES users(id),
 
-      created_at TIMESTAMPTZ
+      created_at
+        TIMESTAMPTZ
         NOT NULL
         DEFAULT NOW(),
 
-      settled_at TIMESTAMPTZ,
+      settled_at
+        TIMESTAMPTZ,
 
-      updated_at TIMESTAMPTZ
+      updated_at
+        TIMESTAMPTZ
         NOT NULL
         DEFAULT NOW()
     )
@@ -1638,6 +2094,10 @@ async function initPaidMatchTables() {
   `);
 }
 
+/* =========================================================
+   RESERVE PAID ENTRY
+========================================================= */
+
 async function reservePaidEntries(
   roomId,
   p1UserId,
@@ -1646,7 +2106,8 @@ async function reservePaidEntries(
   prize
 ) {
   const client =
-    await db.pool.connect();
+    await db.pool
+      .connect();
 
   try {
     await client.query(
@@ -1658,7 +2119,8 @@ async function reservePaidEntries(
         Number(p1UserId),
         Number(p2UserId)
       ].sort(
-        (a, b) => a - b
+        (a, b) =>
+          a - b
       );
 
     const locked =
@@ -1672,17 +2134,21 @@ async function reservePaidEntries(
         FROM users
 
         WHERE
-          id = ANY($1::int[])
+          id =
+          ANY($1::int[])
 
         ORDER BY id
 
         FOR UPDATE
         `,
-        [ids]
+        [
+          ids
+        ]
       );
 
     if (
-      locked.rows.length !== 2
+      locked.rows.length !==
+      2
     ) {
       throw new Error(
         'players_not_found'
@@ -1699,10 +2165,16 @@ async function reservePaidEntries(
         )
       );
 
-    for (const id of ids) {
+    for (
+      const id of ids
+    ) {
+      const user =
+        byId.get(id);
+
       if (
         Number(
-          byId.get(id).balance || 0
+          user.balance ||
+          0
         ) < stake
       ) {
         throw new Error(
@@ -1723,7 +2195,8 @@ async function reservePaidEntries(
           wallet_locked + $1
 
       WHERE
-        id = ANY($2::int[])
+        id =
+        ANY($2::int[])
       `,
       [
         stake,
@@ -1734,7 +2207,8 @@ async function reservePaidEntries(
     const match =
       await client.query(
         `
-        INSERT INTO paid_matches
+        INSERT INTO
+          paid_matches
         (
           room_id,
           p1_user_id,
@@ -1774,7 +2248,9 @@ async function reservePaidEntries(
       'COMMIT'
     );
 
-    return match.rows[0];
+    return (
+      match.rows[0]
+    );
 
   } catch (e) {
     try {
@@ -1790,11 +2266,16 @@ async function reservePaidEntries(
   }
 }
 
+/* =========================================================
+   SETTLE PAID MATCH
+========================================================= */
+
 async function settlePaidMatchIfAgreed(
   matchId
 ) {
   const client =
-    await db.pool.connect();
+    await db.pool
+      .connect();
 
   try {
     await client.query(
@@ -1812,16 +2293,21 @@ async function settlePaidMatchIfAgreed(
 
         FOR UPDATE
         `,
-        [matchId]
+        [
+          matchId
+        ]
       );
 
-    if (!result.rows.length) {
+    if (
+      !result.rows.length
+    ) {
       await client.query(
         'ROLLBACK'
       );
 
       return {
-        status: 'missing'
+        status:
+          'missing'
       };
     }
 
@@ -1837,18 +2323,24 @@ async function settlePaidMatchIfAgreed(
       );
 
       return {
-        status: 'settled',
+        status:
+          'settled',
 
         winnerUserId:
           Number(
-            match.winner_user_id
+            match
+              .winner_user_id
           ),
 
         prize:
-          Number(match.prize),
+          Number(
+            match.prize
+          ),
 
         stake:
-          Number(match.stake)
+          Number(
+            match.stake
+          )
       };
     }
 
@@ -1866,11 +2358,14 @@ async function settlePaidMatchIfAgreed(
       };
     }
 
-    let winnerUserId = null;
+    let winnerUserId =
+      null;
 
     if (
-      match.p1_report === 'win' &&
-      match.p2_report === 'loss'
+      match.p1_report ===
+        'win' &&
+      match.p2_report ===
+        'loss'
     ) {
       winnerUserId =
         Number(
@@ -1879,8 +2374,10 @@ async function settlePaidMatchIfAgreed(
     }
 
     if (
-      match.p2_report === 'win' &&
-      match.p1_report === 'loss'
+      match.p2_report ===
+        'win' &&
+      match.p1_report ===
+        'loss'
     ) {
       winnerUserId =
         Number(
@@ -1888,7 +2385,9 @@ async function settlePaidMatchIfAgreed(
         );
     }
 
-    if (!winnerUserId) {
+    if (
+      !winnerUserId
+    ) {
       await client.query(
         `
         UPDATE paid_matches
@@ -1899,7 +2398,9 @@ async function settlePaidMatchIfAgreed(
 
         WHERE id=$1
         `,
-        [matchId]
+        [
+          matchId
+        ]
       );
 
       await client.query(
@@ -1913,10 +2414,14 @@ async function settlePaidMatchIfAgreed(
     }
 
     const stake =
-      Number(match.stake);
+      Number(
+        match.stake
+      );
 
     const prize =
-      Number(match.prize);
+      Number(
+        match.prize
+      );
 
     const ids =
       [
@@ -1928,7 +2433,8 @@ async function settlePaidMatchIfAgreed(
           match.p2_user_id
         )
       ].sort(
-        (a, b) => a - b
+        (a, b) =>
+          a - b
       );
 
     await client.query(
@@ -1938,13 +2444,16 @@ async function settlePaidMatchIfAgreed(
       FROM users
 
       WHERE
-        id = ANY($1::int[])
+        id =
+        ANY($1::int[])
 
       ORDER BY id
 
       FOR UPDATE
       `,
-      [ids]
+      [
+        ids
+      ]
     );
 
     await client.query(
@@ -1959,7 +2468,8 @@ async function settlePaidMatchIfAgreed(
           )
 
       WHERE
-        id = ANY($2::int[])
+        id =
+        ANY($2::int[])
       `,
       [
         stake,
@@ -2008,7 +2518,9 @@ async function settlePaidMatchIfAgreed(
 
       WHERE id=$1
       `,
-      [loserUserId]
+      [
+        loserUserId
+      ]
     );
 
     await client.query(
@@ -2017,8 +2529,11 @@ async function settlePaidMatchIfAgreed(
 
       SET
         status='settled',
+
         winner_user_id=$1,
+
         settled_at=NOW(),
+
         updated_at=NOW()
 
       WHERE id=$2
@@ -2060,11 +2575,16 @@ async function settlePaidMatchIfAgreed(
   }
 }
 
+/* =========================================================
+   REFUND MATCH
+========================================================= */
+
 async function refundPaidMatch(
   matchId
 ) {
   const client =
-    await db.pool.connect();
+    await db.pool
+      .connect();
 
   try {
     await client.query(
@@ -2082,10 +2602,14 @@ async function refundPaidMatch(
 
         FOR UPDATE
         `,
-        [matchId]
+        [
+          matchId
+        ]
       );
 
-    if (!result.rows.length) {
+    if (
+      !result.rows.length
+    ) {
       await client.query(
         'ROLLBACK'
       );
@@ -2126,7 +2650,8 @@ async function refundPaidMatch(
           match.p2_user_id
         )
       ].sort(
-        (a, b) => a - b
+        (a, b) =>
+          a - b
       );
 
     await client.query(
@@ -2136,13 +2661,16 @@ async function refundPaidMatch(
       FROM users
 
       WHERE
-        id = ANY($1::int[])
+        id =
+        ANY($1::int[])
 
       ORDER BY id
 
       FOR UPDATE
       `,
-      [ids]
+      [
+        ids
+      ]
     );
 
     await client.query(
@@ -2160,7 +2688,8 @@ async function refundPaidMatch(
           )
 
       WHERE
-        id = ANY($2::int[])
+        id =
+        ANY($2::int[])
       `,
       [
         stake,
@@ -2178,7 +2707,9 @@ async function refundPaidMatch(
 
       WHERE id=$1
       `,
-      [matchId]
+      [
+        matchId
+      ]
     );
 
     await client.query(
@@ -2202,7 +2733,7 @@ async function refundPaidMatch(
 }
 
 /* =========================================================
-   MATCH ADMIN
+   ADMIN MATCHES
 ========================================================= */
 
 app.get(
@@ -2230,10 +2761,12 @@ app.get(
       });
 
     } catch {
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
@@ -2245,14 +2778,18 @@ app.post(
     try {
       const ok =
         await refundPaidMatch(
-          Number(req.params.id)
+          Number(
+            req.params.id
+          )
         );
 
       if (!ok) {
-        return res.status(409).json({
-          error:
-            'cannot_refund'
-        });
+        return res
+          .status(409)
+          .json({
+            error:
+              'cannot_refund'
+          });
       }
 
       res.json({
@@ -2260,20 +2797,27 @@ app.post(
       });
 
     } catch {
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
+
+/* =========================================================
+   ADMIN SETTLE
+========================================================= */
 
 app.post(
   '/api/admin/matches/:id/settle',
   adminOnly,
   async (req, res) => {
     const client =
-      await db.pool.connect();
+      await db.pool
+        .connect();
 
     try {
       const winnerUserId =
@@ -2283,14 +2827,17 @@ app.post(
         );
 
       if (
-        !Number.isInteger(
-          winnerUserId
-        )
+        !Number
+          .isInteger(
+            winnerUserId
+          )
       ) {
-        return res.status(400).json({
-          error:
-            'winner_user_id_required'
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              'winner_user_id_required'
+          });
       }
 
       await client.query(
@@ -2315,15 +2862,19 @@ app.post(
           ]
         );
 
-      if (!result.rows.length) {
+      if (
+        !result.rows.length
+      ) {
         await client.query(
           'ROLLBACK'
         );
 
-        return res.status(404).json({
-          error:
-            'not_found'
-        });
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
       }
 
       const match =
@@ -2341,10 +2892,12 @@ app.post(
           'ROLLBACK'
         );
 
-        return res.status(409).json({
-          error:
-            'already_processed'
-        });
+        return res
+          .status(409)
+          .json({
+            error:
+              'already_processed'
+          });
       }
 
       const p1 =
@@ -2358,7 +2911,10 @@ app.post(
         );
 
       if (
-        ![p1, p2].includes(
+        ![
+          p1,
+          p2
+        ].includes(
           winnerUserId
         )
       ) {
@@ -2366,10 +2922,12 @@ app.post(
           'ROLLBACK'
         );
 
-        return res.status(400).json({
-          error:
-            'winner_not_in_match'
-        });
+        return res
+          .status(400)
+          .json({
+            error:
+              'winner_not_in_match'
+          });
       }
 
       const loserUserId =
@@ -2378,8 +2936,12 @@ app.post(
           : p1;
 
       const ids =
-        [p1, p2].sort(
-          (a, b) => a - b
+        [
+          p1,
+          p2
+        ].sort(
+          (a, b) =>
+            a - b
         );
 
       const stake =
@@ -2399,13 +2961,16 @@ app.post(
         FROM users
 
         WHERE
-          id = ANY($1::int[])
+          id =
+          ANY($1::int[])
 
         ORDER BY id
 
         FOR UPDATE
         `,
-        [ids]
+        [
+          ids
+        ]
       );
 
       await client.query(
@@ -2420,7 +2985,8 @@ app.post(
             )
 
         WHERE
-          id = ANY($2::int[])
+          id =
+          ANY($2::int[])
         `,
         [
           stake,
@@ -2457,7 +3023,9 @@ app.post(
 
         WHERE id=$1
         `,
-        [loserUserId]
+        [
+          loserUserId
+        ]
       );
 
       await client.query(
@@ -2466,14 +3034,18 @@ app.post(
 
         SET
           status='settled',
+
           winner_user_id=$1,
+
           settled_at=NOW(),
+
           updated_at=NOW()
 
         WHERE id=$2
         `,
         [
           winnerUserId,
+
           Number(
             req.params.id
           )
@@ -2500,10 +3072,12 @@ app.post(
         );
       } catch {}
 
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
 
     } finally {
       client.release();
@@ -2512,7 +3086,7 @@ app.post(
 );
 
 /* =========================================================
-   LEGACY FREE COIN RESULT
+   FREE / OFFLINE RESULT
 ========================================================= */
 
 app.post(
@@ -2521,13 +3095,16 @@ app.post(
   async (req, res) => {
     try {
       const result =
-        req.body?.result === 'win'
+        req.body
+          ?.result ===
+        'win'
           ? 'win'
           : 'loss';
 
       let entry =
         parseInt(
-          req.body?.entry,
+          req.body
+            ?.entry,
           10
         );
 
@@ -2536,7 +3113,9 @@ app.post(
           100,
           200,
           500
-        ].includes(entry)
+        ].includes(
+          entry
+        )
       ) {
         entry = 100;
       }
@@ -2550,39 +3129,51 @@ app.post(
 
           WHERE id=$1
           `,
-          [req.user.id]
+          [
+            req.user.id
+          ]
         );
 
       if (
-        !userResult.rows.length
+        !userResult
+          .rows.length
       ) {
-        return res.status(404).json({
-          error:
-            'not_found'
-        });
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
       }
 
       const user =
-        userResult.rows[0];
+        userResult
+          .rows[0];
 
       let coins =
         Number(
-          user.coins || 0
+          user.coins ||
+          0
         );
 
       let wins =
         Number(
-          user.wins || 0
+          user.wins ||
+          0
         );
 
       let losses =
         Number(
-          user.losses || 0
+          user.losses ||
+          0
         );
 
-      if (result === 'win') {
+      if (
+        result === 'win'
+      ) {
         coins += entry;
         wins += 1;
+
       } else {
         coins =
           Math.max(
@@ -2623,48 +3214,54 @@ app.post(
       });
 
     } catch {
-      res.status(500).json({
-        error:
-          'server_error'
-      });
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
     }
   }
 );
 
 /* =========================================================
-   ONLINE DOMINO
+   DOMINO TILES
 ========================================================= */
 
 const TILE_VALUES = [
-  [0,0],
-  [1,2],
-  [2,3],
-  [2,4],
-  [1,5],
-  [5,5],
-  [3,6],
-  [0,1],
-  [2,2],
-  [3,3],
-  [3,4],
-  [2,5],
-  [0,6],
-  [4,6],
-  [1,1],
-  [0,3],
-  [0,4],
-  [4,4],
-  [3,5],
-  [1,6],
-  [5,6],
-  [0,2],
-  [1,3],
-  [1,4],
-  [0,5],
-  [4,5],
-  [2,6],
-  [6,6]
+  [0, 0],
+  [1, 2],
+  [2, 3],
+  [2, 4],
+  [1, 5],
+  [5, 5],
+  [3, 6],
+  [0, 1],
+  [2, 2],
+  [3, 3],
+  [3, 4],
+  [2, 5],
+  [0, 6],
+  [4, 6],
+  [1, 1],
+  [0, 3],
+  [0, 4],
+  [4, 4],
+  [3, 5],
+  [1, 6],
+  [5, 6],
+  [0, 2],
+  [1, 3],
+  [1, 4],
+  [0, 5],
+  [4, 5],
+  [2, 6],
+  [6, 6]
 ];
+
+/* =========================================================
+   SHUFFLE
+========================================================= */
 
 function shuffle(array) {
   for (
@@ -2693,6 +3290,10 @@ function shuffle(array) {
   return array;
 }
 
+/* =========================================================
+   DEAL ROUND
+========================================================= */
+
 function dealRound() {
   const deck =
     shuffle([
@@ -2700,14 +3301,23 @@ function dealRound() {
     ]);
 
   const handA =
-    deck.slice(0, 7);
+    deck.slice(
+      0,
+      7
+    );
 
   const handB =
-    deck.slice(7, 14);
+    deck.slice(
+      7,
+      14
+    );
+
+  const boneyard =
+    deck.slice(14);
 
   let starterSeat = 0;
 
-  let bestDbl = -1;
+  let bestDouble = -1;
 
   let bestSum = -1;
 
@@ -2725,13 +3335,17 @@ function dealRound() {
       const value of hand
     ) {
       const tile =
-        TILE_VALUES[value];
+        TILE_VALUES[
+          value
+        ];
 
       if (
-        tile[0] === tile[1] &&
-        tile[0] > bestDbl
+        tile[0] ===
+          tile[1] &&
+        tile[0] >
+          bestDouble
       ) {
-        bestDbl =
+        bestDouble =
           tile[0];
 
         starterSeat =
@@ -2740,7 +3354,9 @@ function dealRound() {
     }
   }
 
-  if (bestDbl < 0) {
+  if (
+    bestDouble < 0
+  ) {
     for (
       let seat = 0;
       seat < 2;
@@ -2755,14 +3371,17 @@ function dealRound() {
         const value of hand
       ) {
         const tile =
-          TILE_VALUES[value];
+          TILE_VALUES[
+            value
+          ];
 
         const sum =
           tile[0] +
           tile[1];
 
         if (
-          sum > bestSum
+          sum >
+          bestSum
         ) {
           bestSum =
             sum;
@@ -2777,12 +3396,13 @@ function dealRound() {
   return {
     handA,
     handB,
+    boneyard,
     starterSeat
   };
 }
 
 /* =========================================================
-   MATCHMAKING
+   MATCHMAKING MEMORY
 ========================================================= */
 
 const waitingQueues =
@@ -2813,10 +3433,23 @@ function queueKey(
   goal
 ) {
   return (
-    `${Number(stake || 0)}:` +
-    `${Number(goal || 100)}`
+    String(
+      Number(
+        stake || 0
+      )
+    ) +
+    ':' +
+    String(
+      Number(
+        goal || 100
+      )
+    )
   );
 }
+
+/* =========================================================
+   START ROUND
+========================================================= */
 
 function startRound(room) {
   const round =
@@ -2824,6 +3457,15 @@ function startRound(room) {
 
   room.deal =
     round;
+
+  room.boneyard =
+    round.boneyard
+      .slice();
+
+  room.hands = [
+    round.handA.slice(),
+    round.handB.slice()
+  ];
 
   io.to(
     room.players[0]
@@ -2841,11 +3483,15 @@ function startRound(room) {
       starterSeat:
         round.starterSeat,
 
+      boneyardCount:
+        room.boneyard.length,
+
       goal:
         room.goal,
 
       match_id:
-        room.matchId || null,
+        room.matchId ||
+        null,
 
       stake:
         room.stake,
@@ -2871,11 +3517,15 @@ function startRound(room) {
       starterSeat:
         round.starterSeat,
 
+      boneyardCount:
+        room.boneyard.length,
+
       goal:
         room.goal,
 
       match_id:
-        room.matchId || null,
+        room.matchId ||
+        null,
 
       stake:
         room.stake,
@@ -2901,16 +3551,22 @@ function emitMatchError(
 }
 
 /* =========================================================
-   SOCKET
+   SOCKET.IO
 ========================================================= */
 
 io.on(
   'connection',
   socket => {
 
+    /* =====================================================
+       FIND MATCH
+    ===================================================== */
+
     socket.on(
       'find_match',
-      async (options = {}) => {
+      async (
+        options = {}
+      ) => {
         try {
           const goal =
             [
@@ -2918,14 +3574,19 @@ io.on(
               200,
               500
             ].includes(
-              Number(options.goal)
+              Number(
+                options.goal
+              )
             )
-              ? Number(options.goal)
+              ? Number(
+                  options.goal
+                )
               : 100;
 
           const stake =
             Number(
-              options.stake || 0
+              options.stake ||
+              0
             );
 
           const isFree =
@@ -2933,7 +3594,9 @@ io.on(
 
           if (
             !isFree &&
-            !PAID_TIERS.has(stake)
+            !PAID_TIERS.has(
+              stake
+            )
           ) {
             return emitMatchError(
               socket,
@@ -2941,7 +3604,8 @@ io.on(
             );
           }
 
-          let userId = null;
+          let userId =
+            null;
 
           if (!isFree) {
             const payload =
@@ -2949,7 +3613,10 @@ io.on(
                 options.token
               );
 
-            if (!payload?.id) {
+            if (
+              !payload ||
+              !payload.id
+            ) {
               return emitMatchError(
                 socket,
                 'login_required'
@@ -2957,22 +3624,28 @@ io.on(
             }
 
             userId =
-              Number(payload.id);
+              Number(
+                payload.id
+              );
 
-            const balanceResult =
+            const result =
               await db.query(
                 `
-                SELECT balance
+                SELECT
+                  balance
 
                 FROM users
 
                 WHERE id=$1
                 `,
-                [userId]
+                [
+                  userId
+                ]
               );
 
             if (
-              !balanceResult.rows.length
+              !result
+                .rows.length
             ) {
               return emitMatchError(
                 socket,
@@ -2982,13 +3655,15 @@ io.on(
 
             const balance =
               Number(
-                balanceResult
+                result
                   .rows[0]
-                  .balance || 0
+                  .balance ||
+                0
               );
 
             if (
-              balance < stake
+              balance <
+              stake
             ) {
               return emitMatchError(
                 socket,
@@ -3006,11 +3681,10 @@ io.on(
           const prize =
             isFree
               ? 0
-              : PAID_TIERS.get(
-                  stake
-                );
+              : PAID_TIERS
+                  .get(stake);
 
-          const info = {
+          const playerInfo = {
             name:
               String(
                 options.name ||
@@ -3037,13 +3711,14 @@ io.on(
             );
 
           const waiting =
-            waitingQueues.get(
-              key
-            );
+            waitingQueues
+              .get(key);
 
           if (
             waiting &&
-            waiting.socket.connected &&
+            waiting.socket &&
+            waiting.socket
+              .connected &&
             waiting.socket.id !==
               socket.id
           ) {
@@ -3058,9 +3733,8 @@ io.on(
               );
             }
 
-            waitingQueues.delete(
-              key
-            );
+            waitingQueues
+              .delete(key);
 
             const player1 =
               waiting.socket;
@@ -3137,7 +3811,16 @@ io.on(
                       userId
                     ],
 
-              moves: 0
+              moves:
+                0,
+
+              boneyard:
+                [],
+
+              hands: [
+                [],
+                []
+              ]
             };
 
             rooms.set(
@@ -3184,7 +3867,7 @@ io.on(
                   room.matchId,
 
                 opp:
-                  info
+                  playerInfo
               }
             );
 
@@ -3229,7 +3912,8 @@ io.on(
 
                 prize,
 
-                info,
+                info:
+                  playerInfo,
 
                 userId
               }
@@ -3253,6 +3937,116 @@ io.on(
           emitMatchError(
             socket,
             'server_error'
+          );
+        }
+      }
+    );
+
+    /* =====================================================
+       DRAW TILE
+    ===================================================== */
+
+    socket.on(
+      'draw_tile',
+      () => {
+        const roomId =
+          socketRoom.get(
+            socket.id
+          );
+
+        if (!roomId) {
+          return;
+        }
+
+        const room =
+          rooms.get(
+            roomId
+          );
+
+        if (
+          !room ||
+          !room.boneyard ||
+          !room.hands
+        ) {
+          return;
+        }
+
+        const seat =
+          room.players[0] ===
+          socket.id
+            ? 0
+            : 1;
+
+        const opponent =
+          otherPlayer(
+            room,
+            socket.id
+          );
+
+        if (
+          room.boneyard
+            .length === 0
+        ) {
+          socket.emit(
+            'draw_tile_result',
+            {
+              ok:
+                false,
+
+              empty:
+                true,
+
+              boneyard_left:
+                0
+            }
+          );
+
+          return;
+        }
+
+        /*
+         * Server selects the tile.
+         * Client cannot choose.
+         */
+
+        const value =
+          room.boneyard
+            .shift();
+
+        room.hands[
+          seat
+        ].push(
+          value
+        );
+
+        socket.emit(
+          'draw_tile_result',
+          {
+            ok:
+              true,
+
+            value,
+
+            boneyard_left:
+              room
+                .boneyard
+                .length
+          }
+        );
+
+        if (opponent) {
+          io.to(
+            opponent
+          ).emit(
+            'opponent_drew',
+            {
+              value,
+
+              boneyard_left:
+                room
+                  .boneyard
+                  .length
+            }
           );
         }
       }
@@ -3285,11 +4079,18 @@ io.on(
 
         room.moves++;
 
-        io.to(
+        const opponent =
           otherPlayer(
             room,
             socket.id
-          )
+          );
+
+        if (!opponent) {
+          return;
+        }
+
+        io.to(
+          opponent
         ).emit(
           'game_move',
           message
@@ -3298,7 +4099,7 @@ io.on(
     );
 
     /* =====================================================
-       REPORT RESULT
+       REPORT PAID RESULT
     ===================================================== */
 
     socket.on(
@@ -3334,17 +4135,24 @@ io.on(
               : 1;
 
           const userId =
-            room.userIds[seat];
+            room.userIds[
+              seat
+            ];
 
           const token =
             verifyMatchToken(
-              payload?.token
+              payload
+                ?.token
             );
 
           if (
             !token ||
-            Number(token.id) !==
-              Number(userId)
+            Number(
+              token.id
+            ) !==
+            Number(
+              userId
+            )
           ) {
             return emitMatchError(
               socket,
@@ -3353,12 +4161,15 @@ io.on(
           }
 
           const report =
-            payload?.didWin === true
+            payload
+              ?.didWin ===
+            true
               ? 'win'
               : 'loss';
 
           const client =
-            await db.pool.connect();
+            await db.pool
+              .connect();
 
           try {
             await client.query(
@@ -3376,11 +4187,14 @@ io.on(
 
                 FOR UPDATE
                 `,
-                [room.matchId]
+                [
+                  room.matchId
+                ]
               );
 
             if (
-              !match.rows.length
+              !match
+                .rows.length
             ) {
               await client.query(
                 'ROLLBACK'
@@ -3394,7 +4208,8 @@ io.on(
                 'active',
                 'disputed'
               ].includes(
-                match.rows[0]
+                match
+                  .rows[0]
                   .status
               )
             ) {
@@ -3412,10 +4227,12 @@ io.on(
 
             await client.query(
               `
-              UPDATE paid_matches
+              UPDATE
+                paid_matches
 
               SET
                 ${column}=$1,
+
                 updated_at=NOW()
 
               WHERE id=$2
@@ -3458,7 +4275,9 @@ io.on(
               i++
             ) {
               io.to(
-                room.players[i]
+                room.players[
+                  i
+                ]
               ).emit(
                 'match_settled',
                 {
@@ -3467,10 +4286,13 @@ io.on(
 
                   won:
                     Number(
-                      room.userIds[i]
+                      room.userIds[
+                        i
+                      ]
                     ) ===
                     Number(
-                      result.winnerUserId
+                      result
+                        .winnerUserId
                     ),
 
                   prize:
@@ -3543,7 +4365,7 @@ io.on(
     );
 
     /* =====================================================
-       CANCEL SEARCH
+       CANCEL FIND
     ===================================================== */
 
     socket.on(
@@ -3554,15 +4376,18 @@ io.on(
             key,
             waiting
           ]
-          of waitingQueues.entries()
+          of
+          waitingQueues
+            .entries()
         ) {
           if (
             waiting.socket.id ===
             socket.id
           ) {
-            waitingQueues.delete(
-              key
-            );
+            waitingQueues
+              .delete(
+                key
+              );
           }
         }
       }
@@ -3580,15 +4405,18 @@ io.on(
             key,
             waiting
           ]
-          of waitingQueues.entries()
+          of
+          waitingQueues
+            .entries()
         ) {
           if (
             waiting.socket.id ===
             socket.id
           ) {
-            waitingQueues.delete(
-              key
-            );
+            waitingQueues
+              .delete(
+                key
+              );
           }
         }
 
@@ -3599,7 +4427,9 @@ io.on(
 
         if (
           roomId &&
-          rooms.has(roomId)
+          rooms.has(
+            roomId
+          )
         ) {
           const room =
             rooms.get(
@@ -3612,14 +4442,17 @@ io.on(
               socket.id
             );
 
-          if (opponent) {
+          if (
+            opponent
+          ) {
             io.to(
               opponent
             ).emit(
               'opponent_left',
               {
                 paid:
-                  room.stake > 0,
+                  room.stake >
+                  0,
 
                 match_id:
                   room.matchId
@@ -3627,18 +4460,16 @@ io.on(
             );
           }
 
-          room.players.forEach(
-            id => {
-              socketRoom.delete(
-                id
-              );
-            }
-          );
+          room.players
+            .forEach(
+              id => {
+                socketRoom
+                  .delete(id);
+              }
+            );
 
           /*
-           * Paid balance stays locked
-           * if a player disconnects.
-           *
+           * Paid balance stays locked.
            * Admin can later settle
            * or refund the match.
            */
@@ -3657,7 +4488,8 @@ io.on(
 ========================================================= */
 
 const PORT =
-  process.env.PORT || 3000;
+  process.env.PORT ||
+  3000;
 
 async function startServer() {
   try {
