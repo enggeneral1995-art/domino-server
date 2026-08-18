@@ -18,6 +18,337 @@ const JWT_SECRET =
 const ADMIN_TOKEN =
   process.env.ADMIN_TOKEN || '';
 
+const NOWPAYMENTS_API_KEY =
+  process.env.NOWPAYMENTS_API_KEY || '';
+
+const NOWPAYMENTS_IPN_SECRET =
+  process.env.NOWPAYMENTS_IPN_SECRET || '';
+
+const NOWPAYMENTS_EMAIL =
+  process.env.NOWPAYMENTS_EMAIL || '';
+
+const NOWPAYMENTS_PASSWORD =
+  process.env.NOWPAYMENTS_PASSWORD || '';
+
+const NOWPAYMENTS_2FA_SECRET =
+  process.env.NOWPAYMENTS_2FA_SECRET || '';
+
+const NOWPAYMENTS_IPN_URL =
+  process.env.NOWPAYMENTS_IPN_URL ||
+  'https://domino-server-production-dcd7.up.railway.app/api/nowpayments/ipn';
+
+const NOWPAYMENTS_API_BASE =
+  'https://api.nowpayments.io/v1';
+
+const NOWPAYMENTS_NETWORK_CURRENCY = {
+  TRC20: 'USDTTRC20',
+  BEP20: 'USDTBSC',
+  ERC20: 'USDTERC20'
+};
+
+function sortObjectDeep(value) {
+  if (Array.isArray(value)) {
+    return value.map(sortObjectDeep);
+  }
+
+  if (
+    value &&
+    typeof value === 'object'
+  ) {
+    return Object.keys(value)
+      .sort()
+      .reduce((result, key) => {
+        result[key] =
+          sortObjectDeep(value[key]);
+        return result;
+      }, {});
+  }
+
+  return value;
+}
+
+function verifyNowPaymentsIpn(body, receivedSig) {
+  if (
+    !NOWPAYMENTS_IPN_SECRET ||
+    !receivedSig
+  ) {
+    return false;
+  }
+
+  const sorted =
+    sortObjectDeep(body || {});
+
+  const expected =
+    crypto
+      .createHmac(
+        'sha512',
+        NOWPAYMENTS_IPN_SECRET
+      )
+      .update(
+        JSON.stringify(sorted)
+      )
+      .digest('hex');
+
+  const a =
+    Buffer.from(
+      expected,
+      'utf8'
+    );
+
+  const b =
+    Buffer.from(
+      String(receivedSig),
+      'utf8'
+    );
+
+  return (
+    a.length === b.length &&
+    crypto.timingSafeEqual(a, b)
+  );
+}
+
+async function nowPaymentsRequest(
+  path,
+  options = {}
+) {
+  if (!NOWPAYMENTS_API_KEY) {
+    throw new Error(
+      'nowpayments_api_key_missing'
+    );
+  }
+
+  const headers = {
+    'Content-Type':
+      'application/json',
+
+    'x-api-key':
+      NOWPAYMENTS_API_KEY,
+
+    ...(options.headers || {})
+  };
+
+  const response =
+    await fetch(
+      NOWPAYMENTS_API_BASE + path,
+      {
+        method:
+          options.method ||
+          'GET',
+
+        headers,
+
+        body:
+          options.body === undefined
+            ? undefined
+            : JSON.stringify(
+                options.body
+              )
+      }
+    );
+
+  const text =
+    await response.text();
+
+  let data = null;
+
+  try {
+    data =
+      text
+        ? JSON.parse(text)
+        : {};
+  } catch {
+    data = {
+      raw: text
+    };
+  }
+
+  if (!response.ok) {
+    const error =
+      new Error(
+        'nowpayments_request_failed'
+      );
+
+    error.status =
+      response.status;
+
+    error.data =
+      data;
+
+    throw error;
+  }
+
+  return data;
+}
+
+async function getNowPaymentsJwt() {
+  if (
+    !NOWPAYMENTS_EMAIL ||
+    !NOWPAYMENTS_PASSWORD
+  ) {
+    throw new Error(
+      'nowpayments_payout_credentials_missing'
+    );
+  }
+
+  const response =
+    await fetch(
+      NOWPAYMENTS_API_BASE +
+        '/auth',
+      {
+        method: 'POST',
+
+        headers: {
+          'Content-Type':
+            'application/json'
+        },
+
+        body:
+          JSON.stringify({
+            email:
+              NOWPAYMENTS_EMAIL,
+
+            password:
+              NOWPAYMENTS_PASSWORD
+          })
+      }
+    );
+
+  const data =
+    await response.json();
+
+  if (
+    !response.ok ||
+    !data.token
+  ) {
+    const error =
+      new Error(
+        'nowpayments_auth_failed'
+      );
+
+    error.data =
+      data;
+
+    throw error;
+  }
+
+  return data.token;
+}
+
+function base32ToBuffer(base32) {
+  const alphabet =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+  const clean =
+    String(base32 || '')
+      .replace(/\s+/g, '')
+      .replace(/=+$/g, '')
+      .toUpperCase();
+
+  let bits = '';
+
+  for (const ch of clean) {
+    const value =
+      alphabet.indexOf(ch);
+
+    if (value < 0) {
+      throw new Error(
+        'invalid_2fa_secret'
+      );
+    }
+
+    bits +=
+      value
+        .toString(2)
+        .padStart(5, '0');
+  }
+
+  const bytes = [];
+
+  for (
+    let i = 0;
+    i + 8 <= bits.length;
+    i += 8
+  ) {
+    bytes.push(
+      parseInt(
+        bits.slice(
+          i,
+          i + 8
+        ),
+        2
+      )
+    );
+  }
+
+  return Buffer.from(bytes);
+}
+
+function generateTotp(secret) {
+  const key =
+    base32ToBuffer(secret);
+
+  const counter =
+    Math.floor(
+      Date.now() /
+      1000 /
+      30
+    );
+
+  const msg =
+    Buffer.alloc(8);
+
+  let n =
+    BigInt(counter);
+
+  for (
+    let i = 7;
+    i >= 0;
+    i--
+  ) {
+    msg[i] =
+      Number(
+        n & 0xffn
+      );
+
+    n >>= 8n;
+  }
+
+  const hmac =
+    crypto
+      .createHmac(
+        'sha1',
+        key
+      )
+      .update(msg)
+      .digest();
+
+  const offset =
+    hmac[
+      hmac.length - 1
+    ] & 0x0f;
+
+  const code =
+    (
+      (
+        hmac[offset] &
+        0x7f
+      ) << 24
+    ) |
+    (
+      hmac[offset + 1]
+      << 16
+    ) |
+    (
+      hmac[offset + 2]
+      << 8
+    ) |
+    hmac[offset + 3];
+
+  return String(
+    code % 1000000
+  ).padStart(6, '0');
+}
+
 const app = express();
 
 app.use(
@@ -532,7 +863,9 @@ app.get(
 
           WHERE id=$1
           `,
-          [req.user.id]
+          [
+            req.user.id
+          ]
         );
 
       if (
@@ -582,7 +915,9 @@ app.get(
 
           WHERE id=$1
           `,
-          [req.user.id]
+          [
+            req.user.id
+          ]
         );
 
       if (
@@ -922,6 +1257,47 @@ async function initWalletTables() {
         created_at DESC
       )
   `);
+
+  await db.query(`
+    ALTER TABLE wallet_transactions
+    ADD COLUMN IF NOT EXISTS
+      provider TEXT
+  `);
+
+  await db.query(`
+    ALTER TABLE wallet_transactions
+    ADD COLUMN IF NOT EXISTS
+      provider_payment_id TEXT
+  `);
+
+  await db.query(`
+    ALTER TABLE wallet_transactions
+    ADD COLUMN IF NOT EXISTS
+      provider_payout_id TEXT
+  `);
+
+  await db.query(`
+    ALTER TABLE wallet_transactions
+    ADD COLUMN IF NOT EXISTS
+      provider_status TEXT
+  `);
+
+  await db.query(`
+    ALTER TABLE wallet_transactions
+    ADD COLUMN IF NOT EXISTS
+      order_id TEXT
+  `);
+
+  await db.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS
+      wallet_provider_payment_unique
+    ON wallet_transactions(
+      provider_payment_id
+    )
+    WHERE
+      provider_payment_id
+      IS NOT NULL
+  `);
 }
 
 /* =========================================================
@@ -1019,6 +1395,1288 @@ app.get(
           error:
             'server_error'
         });
+    }
+  }
+);
+
+/* =========================================================
+   NOWPAYMENTS — AUTOMATIC DEPOSIT
+========================================================= */
+
+app.post(
+  '/api/nowpayments/deposit',
+  auth,
+  async (req, res) => {
+    try {
+      const amount =
+        Number(
+          req.body
+            ?.amount
+        );
+
+      const network =
+        String(
+          req.body
+            ?.network ||
+          ''
+        ).toUpperCase();
+
+      if (
+        !Number.isFinite(amount) ||
+        amount <= 0
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_amount'
+          });
+      }
+
+      if (
+        !USDT_NETWORKS
+          .has(network)
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_network'
+          });
+      }
+
+      const payCurrency =
+        NOWPAYMENTS_NETWORK_CURRENCY[
+          network
+        ];
+
+      const orderId =
+        [
+          'yd',
+          req.user.id,
+          Date.now(),
+          crypto
+            .randomBytes(4)
+            .toString('hex')
+        ].join('-');
+
+      const payment =
+        await nowPaymentsRequest(
+          '/payment',
+          {
+            method: 'POST',
+
+            body: {
+              price_amount:
+                Number(
+                  amount.toFixed(2)
+                ),
+
+              price_currency:
+                'usd',
+
+              pay_currency:
+                payCurrency,
+
+              ipn_callback_url:
+                NOWPAYMENTS_IPN_URL,
+
+              order_id:
+                orderId,
+
+              order_description:
+                'Yalla Domino USDT deposit',
+
+              is_fixed_rate:
+                true,
+
+              is_fee_paid_by_user:
+                false
+            }
+          }
+        );
+
+      const paymentId =
+        String(
+          payment.payment_id ||
+          ''
+        );
+
+      if (!paymentId) {
+        return res
+          .status(502)
+          .json({
+            error:
+              'payment_id_missing'
+          });
+      }
+
+      await db.query(
+        `
+        INSERT INTO
+          wallet_transactions
+        (
+          user_id,
+          type,
+          network,
+          amount,
+          address,
+          status,
+          provider,
+          provider_payment_id,
+          provider_status,
+          order_id
+        )
+
+        VALUES
+        (
+          $1,
+          'deposit',
+          $2,
+          $3,
+          $4,
+          'pending',
+          'nowpayments',
+          $5,
+          $6,
+          $7
+        )
+        `,
+        [
+          req.user.id,
+          network,
+          amount,
+          payment.pay_address ||
+            null,
+          paymentId,
+          payment.payment_status ||
+            'waiting',
+          orderId
+        ]
+      );
+
+      res.json({
+        ok: true,
+
+        payment_id:
+          paymentId,
+
+        status:
+          payment.payment_status,
+
+        network,
+
+        pay_currency:
+          payment.pay_currency,
+
+        pay_address:
+          payment.pay_address,
+
+        pay_amount:
+          Number(
+            payment.pay_amount ||
+            0
+          ),
+
+        price_amount:
+          Number(
+            payment.price_amount ||
+            amount
+          ),
+
+        price_currency:
+          payment.price_currency ||
+          'usd',
+
+        order_id:
+          orderId,
+
+        expires_at:
+          payment.expiration_estimate_date ||
+          null
+      });
+
+    } catch (e) {
+      console.error(
+        'NOWPayments deposit create error:',
+        e.message,
+        e.data || ''
+      );
+
+      res
+        .status(
+          e.status || 500
+        )
+        .json({
+          error:
+            'nowpayments_deposit_failed',
+
+          details:
+            e.data || null
+        });
+    }
+  }
+);
+
+app.get(
+  '/api/nowpayments/payment/:id',
+  auth,
+  async (req, res) => {
+    try {
+      const local =
+        await db.query(
+          `
+          SELECT
+            id,
+            user_id,
+            status,
+            provider_status,
+            amount,
+            network
+          FROM
+            wallet_transactions
+          WHERE
+            provider='nowpayments'
+            AND
+            provider_payment_id=$1
+            AND
+            user_id=$2
+          LIMIT 1
+          `,
+          [
+            String(
+              req.params.id
+            ),
+            req.user.id
+          ]
+        );
+
+      if (
+        !local.rows.length
+      ) {
+        return res
+          .status(404)
+          .json({
+            error:
+              'payment_not_found'
+          });
+      }
+
+      const payment =
+        await nowPaymentsRequest(
+          '/payment/' +
+          encodeURIComponent(
+            req.params.id
+          )
+        );
+
+      res.json({
+        ok: true,
+        payment
+      });
+
+    } catch (e) {
+      res
+        .status(
+          e.status || 500
+        )
+        .json({
+          error:
+            'payment_status_failed',
+
+          details:
+            e.data || null
+        });
+    }
+  }
+);
+
+/* =========================================================
+   NOWPAYMENTS — IPN / WEBHOOK
+========================================================= */
+
+app.post(
+  '/api/nowpayments/ipn',
+  async (req, res) => {
+    const signature =
+      req.headers[
+        'x-nowpayments-sig'
+      ];
+
+    if (
+      !verifyNowPaymentsIpn(
+        req.body,
+        signature
+      )
+    ) {
+      return res
+        .status(401)
+        .json({
+          error:
+            'bad_ipn_signature'
+        });
+    }
+
+    try {
+      const payload =
+        req.body || {};
+
+      const paymentId =
+        payload.payment_id != null
+          ? String(
+              payload.payment_id
+            )
+          : null;
+
+      const payoutId =
+        payload.id != null
+          ? String(
+              payload.id
+            )
+          : null;
+
+      const status =
+        String(
+          payload.payment_status ||
+          payload.status ||
+          ''
+        ).toLowerCase();
+
+      if (paymentId) {
+        const client =
+          await db.pool
+            .connect();
+
+        try {
+          await client.query(
+            'BEGIN'
+          );
+
+          const tx =
+            await client.query(
+              `
+              SELECT *
+              FROM
+                wallet_transactions
+              WHERE
+                provider='nowpayments'
+                AND
+                provider_payment_id=$1
+                AND
+                type='deposit'
+              FOR UPDATE
+              `,
+              [paymentId]
+            );
+
+          if (
+            !tx.rows.length
+          ) {
+            await client.query(
+              'ROLLBACK'
+            );
+
+            return res.json({
+              ok: true,
+              ignored:
+                'unknown_payment'
+            });
+          }
+
+          const transaction =
+            tx.rows[0];
+
+          await client.query(
+            `
+            UPDATE
+              wallet_transactions
+            SET
+              provider_status=$1,
+              updated_at=NOW()
+            WHERE id=$2
+            `,
+            [
+              status,
+              transaction.id
+            ]
+          );
+
+          if (
+            status ===
+              'finished' &&
+            transaction.status !==
+              'confirmed'
+          ) {
+            const requestedAmount =
+              Number(
+                transaction.amount
+              );
+
+            const callbackPrice =
+              Number(
+                payload.price_amount
+              );
+
+            if (
+              Number.isFinite(
+                callbackPrice
+              ) &&
+              Math.abs(
+                callbackPrice -
+                requestedAmount
+              ) > 0.01
+            ) {
+              await client.query(
+                `
+                UPDATE
+                  wallet_transactions
+                SET
+                  status='review',
+                  updated_at=NOW()
+                WHERE id=$1
+                `,
+                [
+                  transaction.id
+                ]
+              );
+
+              await client.query(
+                'COMMIT'
+              );
+
+              return res.json({
+                ok: true,
+                review:
+                  'amount_mismatch'
+              });
+            }
+
+            await client.query(
+              `
+              UPDATE users
+              SET
+                balance =
+                  balance + $1
+              WHERE id=$2
+              `,
+              [
+                requestedAmount,
+                transaction.user_id
+              ]
+            );
+
+            await client.query(
+              `
+              UPDATE
+                wallet_transactions
+              SET
+                status='confirmed',
+                provider_status='finished',
+                updated_at=NOW()
+              WHERE id=$1
+              `,
+              [
+                transaction.id
+              ]
+            );
+          }
+
+          if (
+            [
+              'failed',
+              'expired',
+              'refunded'
+            ].includes(status) &&
+            transaction.status ===
+              'pending'
+          ) {
+            await client.query(
+              `
+              UPDATE
+                wallet_transactions
+              SET
+                status=$1,
+                updated_at=NOW()
+              WHERE id=$2
+              `,
+              [
+                status,
+                transaction.id
+              ]
+            );
+          }
+
+          await client.query(
+            'COMMIT'
+          );
+
+        } catch (e) {
+          try {
+            await client.query(
+              'ROLLBACK'
+            );
+          } catch {}
+
+          throw e;
+
+        } finally {
+          client.release();
+        }
+
+        return res.json({
+          ok: true
+        });
+      }
+
+      if (payoutId) {
+        const tx =
+          await db.query(
+            `
+            SELECT *
+            FROM
+              wallet_transactions
+            WHERE
+              provider='nowpayments'
+              AND
+              provider_payout_id=$1
+              AND
+              type='withdraw'
+            LIMIT 1
+            `,
+            [payoutId]
+          );
+
+        if (
+          !tx.rows.length
+        ) {
+          return res.json({
+            ok: true,
+            ignored:
+              'unknown_payout'
+          });
+        }
+
+        const transaction =
+          tx.rows[0];
+
+        await db.query(
+          `
+          UPDATE
+            wallet_transactions
+          SET
+            provider_status=$1,
+            updated_at=NOW()
+          WHERE id=$2
+          `,
+          [
+            status,
+            transaction.id
+          ]
+        );
+
+        if (
+          status ===
+            'finished' &&
+          transaction.status ===
+            'pending'
+        ) {
+          await db.query(
+            `
+            UPDATE users
+            SET
+              wallet_locked =
+                GREATEST(
+                  0,
+                  wallet_locked - $1
+                )
+            WHERE id=$2
+            `,
+            [
+              Number(
+                transaction.amount
+              ),
+              transaction.user_id
+            ]
+          );
+
+          await db.query(
+            `
+            UPDATE
+              wallet_transactions
+            SET
+              status='completed',
+              provider_status='finished',
+              updated_at=NOW()
+            WHERE id=$1
+            `,
+            [
+              transaction.id
+            ]
+          );
+        }
+
+        if (
+          [
+            'failed',
+            'rejected'
+          ].includes(status) &&
+          transaction.status ===
+            'pending'
+        ) {
+          const client =
+            await db.pool
+              .connect();
+
+          try {
+            await client.query(
+              'BEGIN'
+            );
+
+            const locked =
+              await client.query(
+                `
+                SELECT *
+                FROM
+                  wallet_transactions
+                WHERE id=$1
+                FOR UPDATE
+                `,
+                [
+                  transaction.id
+                ]
+              );
+
+            if (
+              locked.rows.length &&
+              locked.rows[0]
+                .status ===
+                'pending'
+            ) {
+              await client.query(
+                `
+                UPDATE users
+                SET
+                  balance =
+                    balance + $1,
+                  wallet_locked =
+                    GREATEST(
+                      0,
+                      wallet_locked - $1
+                    )
+                WHERE id=$2
+                `,
+                [
+                  Number(
+                    transaction.amount
+                  ),
+                  transaction.user_id
+                ]
+              );
+
+              await client.query(
+                `
+                UPDATE
+                  wallet_transactions
+                SET
+                  status=$1,
+                  provider_status=$1,
+                  updated_at=NOW()
+                WHERE id=$2
+                `,
+                [
+                  status,
+                  transaction.id
+                ]
+              );
+            }
+
+            await client.query(
+              'COMMIT'
+            );
+
+          } catch (e) {
+            try {
+              await client.query(
+                'ROLLBACK'
+              );
+            } catch {}
+
+            throw e;
+
+          } finally {
+            client.release();
+          }
+        }
+
+        return res.json({
+          ok: true
+        });
+      }
+
+      return res.json({
+        ok: true,
+        ignored:
+          'unknown_callback'
+      });
+
+    } catch (e) {
+      console.error(
+        'NOWPayments IPN error:',
+        e
+      );
+
+      return res
+        .status(500)
+        .json({
+          error:
+            'ipn_processing_failed'
+        });
+    }
+  }
+);
+
+/* =========================================================
+   NOWPAYMENTS — AUTOMATIC PAYOUT
+========================================================= */
+
+app.post(
+  '/api/nowpayments/withdraw',
+  auth,
+  async (req, res) => {
+    const client =
+      await db.pool
+        .connect();
+
+    try {
+      const network =
+        String(
+          req.body
+            ?.network ||
+          ''
+        ).toUpperCase();
+
+      const address =
+        String(
+          req.body
+            ?.address ||
+          ''
+        ).trim();
+
+      const amount =
+        Number(
+          req.body
+            ?.amount
+        );
+
+      if (
+        !USDT_NETWORKS
+          .has(network)
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_network'
+          });
+      }
+
+      if (
+        !validUsdtAddress(
+          network,
+          address
+        )
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_address_for_network'
+          });
+      }
+
+      if (
+        !Number.isFinite(amount) ||
+        amount < MIN_WITHDRAW ||
+        amount > MAX_WITHDRAW
+      ) {
+        return res
+          .status(400)
+          .json({
+            error:
+              'invalid_amount',
+
+            min:
+              MIN_WITHDRAW,
+
+            max:
+              MAX_WITHDRAW
+          });
+      }
+
+      if (
+        !NOWPAYMENTS_EMAIL ||
+        !NOWPAYMENTS_PASSWORD
+      ) {
+        return res
+          .status(503)
+          .json({
+            error:
+              'payout_setup_required',
+
+            missing: [
+              'NOWPAYMENTS_EMAIL',
+              'NOWPAYMENTS_PASSWORD'
+            ]
+          });
+      }
+
+      if (
+        !NOWPAYMENTS_2FA_SECRET
+      ) {
+        return res
+          .status(503)
+          .json({
+            error:
+              'payout_2fa_setup_required',
+
+            missing: [
+              'NOWPAYMENTS_2FA_SECRET'
+            ]
+          });
+      }
+
+      await client.query(
+        'BEGIN'
+      );
+
+      const userResult =
+        await client.query(
+          `
+          SELECT
+            balance,
+            wallet_locked
+          FROM users
+          WHERE id=$1
+          FOR UPDATE
+          `,
+          [
+            req.user.id
+          ]
+        );
+
+      if (
+        !userResult.rows.length
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res
+          .status(404)
+          .json({
+            error:
+              'not_found'
+          });
+      }
+
+      if (
+        Number(
+          userResult.rows[0]
+            .balance ||
+          0
+        ) < amount
+      ) {
+        await client.query(
+          'ROLLBACK'
+        );
+
+        return res
+          .status(400)
+          .json({
+            error:
+              'insufficient_balance'
+          });
+      }
+
+      const currency =
+        NOWPAYMENTS_NETWORK_CURRENCY[
+          network
+        ];
+
+      await nowPaymentsRequest(
+        '/payout/validate-address',
+        {
+          method: 'POST',
+
+          body: {
+            address,
+            currency
+          }
+        }
+      );
+
+      const reserved =
+        await client.query(
+          `
+          UPDATE users
+          SET
+            balance =
+              balance - $1,
+            wallet_locked =
+              wallet_locked + $1
+          WHERE id=$2
+          RETURNING
+            balance,
+            wallet_locked
+          `,
+          [
+            amount,
+            req.user.id
+          ]
+        );
+
+      const externalId =
+        [
+          'yd-withdraw',
+          req.user.id,
+          Date.now(),
+          crypto
+            .randomBytes(4)
+            .toString('hex')
+        ].join('-');
+
+      const localTx =
+        await client.query(
+          `
+          INSERT INTO
+            wallet_transactions
+          (
+            user_id,
+            type,
+            network,
+            amount,
+            address,
+            status,
+            fee,
+            provider,
+            provider_status,
+            order_id
+          )
+          VALUES
+          (
+            $1,
+            'withdraw',
+            $2,
+            $3,
+            $4,
+            'pending',
+            $5,
+            'nowpayments',
+            'creating',
+            $6
+          )
+          RETURNING *
+          `,
+          [
+            req.user.id,
+            network,
+            amount,
+            address,
+            WITHDRAW_FEE,
+            externalId
+          ]
+        );
+
+      await client.query(
+        'COMMIT'
+      );
+
+      let batchId = null;
+      let payoutId = null;
+
+      try {
+        const jwtToken =
+          await getNowPaymentsJwt();
+
+        const payoutResponse =
+          await nowPaymentsRequest(
+            '/payout',
+            {
+              method: 'POST',
+
+              headers: {
+                Authorization:
+                  'Bearer ' +
+                  jwtToken
+              },
+
+              body: {
+                payout_description:
+                  'Yalla Domino withdrawal',
+
+                ipn_callback_url:
+                  NOWPAYMENTS_IPN_URL,
+
+                withdrawals: [
+                  {
+                    address,
+
+                    currency,
+
+                    amount:
+                      Number(
+                        amount.toFixed(6)
+                      ),
+
+                    ipn_callback_url:
+                      NOWPAYMENTS_IPN_URL,
+
+                    unique_external_id:
+                      externalId
+                  }
+                ]
+              }
+            }
+          );
+
+        batchId =
+          String(
+            payoutResponse.id ||
+            payoutResponse.batch_withdrawal_id ||
+            payoutResponse.batch_id ||
+            ''
+          );
+
+        const firstWithdrawal =
+          Array.isArray(
+            payoutResponse.withdrawals
+          )
+            ? payoutResponse
+                .withdrawals[0]
+            : null;
+
+        payoutId =
+          firstWithdrawal?.id != null
+            ? String(
+                firstWithdrawal.id
+              )
+            : null;
+
+        await db.query(
+          `
+          UPDATE
+            wallet_transactions
+          SET
+            provider_payout_id=$1,
+            provider_status=$2,
+            tx_hash=$3,
+            updated_at=NOW()
+          WHERE id=$4
+          `,
+          [
+            payoutId ||
+              batchId ||
+              null,
+
+            String(
+              firstWithdrawal
+                ?.status ||
+              payoutResponse.status ||
+              'creating'
+            ).toLowerCase(),
+
+            batchId ||
+              null,
+
+            localTx.rows[0].id
+          ]
+        );
+
+        if (!batchId) {
+          throw new Error(
+            'payout_batch_id_missing'
+          );
+        }
+
+        const verificationCode =
+          generateTotp(
+            NOWPAYMENTS_2FA_SECRET
+          );
+
+        await nowPaymentsRequest(
+          '/payout/' +
+            encodeURIComponent(
+              batchId
+            ) +
+            '/verify',
+          {
+            method: 'POST',
+
+            headers: {
+              Authorization:
+                'Bearer ' +
+                jwtToken
+            },
+
+            body: {
+              verification_code:
+                verificationCode
+            }
+          }
+        );
+
+        await db.query(
+          `
+          UPDATE
+            wallet_transactions
+          SET
+            provider_status='waiting',
+            updated_at=NOW()
+          WHERE id=$1
+          `,
+          [
+            localTx.rows[0].id
+          ]
+        );
+
+        return res.json({
+          ok: true,
+
+          transaction_id:
+            localTx.rows[0].id,
+
+          payout_id:
+            payoutId,
+
+          batch_id:
+            batchId,
+
+          status:
+            'waiting',
+
+          balance:
+            Number(
+              reserved.rows[0]
+                .balance
+            ),
+
+          locked_balance:
+            Number(
+              reserved.rows[0]
+                .wallet_locked
+            )
+        });
+
+      } catch (payoutError) {
+        const rollbackClient =
+          await db.pool
+            .connect();
+
+        try {
+          await rollbackClient.query(
+            'BEGIN'
+          );
+
+          const lockedTx =
+            await rollbackClient.query(
+              `
+              SELECT *
+              FROM
+                wallet_transactions
+              WHERE id=$1
+              FOR UPDATE
+              `,
+              [
+                localTx.rows[0].id
+              ]
+            );
+
+          if (
+            lockedTx.rows.length &&
+            lockedTx.rows[0]
+              .status ===
+              'pending'
+          ) {
+            await rollbackClient.query(
+              `
+              UPDATE users
+              SET
+                balance =
+                  balance + $1,
+                wallet_locked =
+                  GREATEST(
+                    0,
+                    wallet_locked - $1
+                  )
+              WHERE id=$2
+              `,
+              [
+                amount,
+                req.user.id
+              ]
+            );
+
+            await rollbackClient.query(
+              `
+              UPDATE
+                wallet_transactions
+              SET
+                status='failed',
+                provider_status='failed',
+                updated_at=NOW()
+              WHERE id=$1
+              `,
+              [
+                localTx.rows[0].id
+              ]
+            );
+          }
+
+          await rollbackClient.query(
+            'COMMIT'
+          );
+
+        } catch {
+          try {
+            await rollbackClient.query(
+              'ROLLBACK'
+            );
+          } catch {}
+
+        } finally {
+          rollbackClient.release();
+        }
+
+        throw payoutError;
+      }
+
+    } catch (e) {
+      try {
+        await client.query(
+          'ROLLBACK'
+        );
+      } catch {}
+
+      console.error(
+        'NOWPayments withdraw error:',
+        e.message,
+        e.data || ''
+      );
+
+      res
+        .status(
+          e.status || 500
+        )
+        .json({
+          error:
+            'nowpayments_withdraw_failed',
+
+          details:
+            e.data || null
+        });
+
+    } finally {
+      client.release();
     }
   }
 );
@@ -4004,11 +5662,6 @@ io.on(
           return;
         }
 
-        /*
-         * Server selects the tile.
-         * Client cannot choose.
-         */
-
         const value =
           room.boneyard
             .shift();
@@ -4467,12 +6120,6 @@ io.on(
                   .delete(id);
               }
             );
-
-          /*
-           * Paid balance stays locked.
-           * Admin can later settle
-           * or refund the match.
-           */
 
           rooms.delete(
             roomId
