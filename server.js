@@ -4402,7 +4402,58 @@ async function refundPaidMatch(
     client.release();
   }
 }
+/* =========================================================
+   ADMIN USERS
+========================================================= */
 
+app.get(
+  '/api/admin/users',
+  adminOnly,
+  async (_req, res) => {
+    try {
+      const result = await db.query(`
+        SELECT
+          id,
+          email,
+          phone,
+          balance,
+          coins,
+          username,
+          wins,
+          losses,
+          avatar
+        FROM users
+        ORDER BY id DESC
+      `);
+
+      res.json({
+        ok: true,
+        users: result.rows.map(user => ({
+          id: user.id,
+          email: user.email,
+          phone: user.phone || null,
+          username: user.username || null,
+          balance: Number(user.balance || 0),
+          coins: Number(user.coins || 0),
+          wins: Number(user.wins || 0),
+          losses: Number(user.losses || 0),
+          avatar: user.avatar || null
+        }))
+      });
+
+    } catch (e) {
+      console.error(
+        'admin users error:',
+        e.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: 'server_error'
+      });
+    }
+  }
+);
 /* =========================================================
    ADMIN MATCHES
 ========================================================= */
