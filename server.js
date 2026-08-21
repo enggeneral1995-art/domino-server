@@ -1440,6 +1440,62 @@ app.post(
 );
 
 /* =========================================================
+   APP CONFIG (PAID FEATURES ON/OFF SWITCH)
+========================================================= */
+
+async function initAppConfig() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS app_config (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      paid_enabled BOOLEAN NOT NULL DEFAULT true,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT app_config_singleton CHECK (id = 1)
+    )
+  `);
+  await db.query(`
+    INSERT INTO app_config (id, paid_enabled)
+    VALUES (1, true)
+    ON CONFLICT (id) DO NOTHING
+  `);
+}
+
+async function isPaidEnabled() {
+  try {
+    const result = await db.query(`SELECT paid_enabled FROM app_config WHERE id=1`);
+    return result.rows.length ? !!result.rows[0].paid_enabled : true;
+  } catch (e) {
+    return true;
+  }
+}
+
+app.get('/api/app-config', async (req, res) => {
+  try {
+    const paidEnabled = await isPaidEnabled();
+    res.json({ paid_enabled: paidEnabled });
+  } catch (e) {
+    res.json({ paid_enabled: true });
+  }
+});
+
+app.post('/api/admin/app-config', adminOnly, async (req, res) => {
+  try {
+    const paidEnabled = req.body?.paid_enabled;
+    if (typeof paidEnabled !== 'boolean') {
+      return res.status(400).json({ error: 'paid_enabled_required' });
+    }
+    await db.query(`
+      UPDATE app_config
+      SET paid_enabled=$1, updated_at=NOW()
+      WHERE id=1
+    `, [paidEnabled]);
+    res.json({ ok: true, paid_enabled: paidEnabled });
+  } catch (e) {
+    console.error('app-config update error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* =========================================================
    WALLET CONFIG
 ========================================================= */
 
@@ -1779,6 +1835,12 @@ app.post(
   auth,
   async (req, res) => {
     try {
+      if (!(await isPaidEnabled())) {
+        return res
+          .status(403)
+          .json({ error: 'paid_features_disabled' });
+      }
+
       const amount =
         Number(
           req.body
@@ -6217,6 +6279,16 @@ io.on(
 
           if (
             !isFree &&
+            !(await isPaidEnabled())
+          ) {
+            return emitMatchError(
+              socket,
+              'paid_features_disabled'
+            );
+          }
+
+          if (
+            !isFree &&
             !PAID_TIERS.has(
               stake
             )
@@ -7164,6 +7236,8 @@ async function startServer() {
     await initTournamentTables();
 
     await initVisitTables();
+
+    await initAppConfig();
 
     await checkAndPayoutTournament();
     setInterval(checkAndPayoutTournament, 60 * 60 * 1000);
