@@ -4134,7 +4134,6 @@ async function initTournamentTables() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS tournament_config (
       id INTEGER PRIMARY KEY DEFAULT 1,
-      prize_amount NUMERIC(20,8) NOT NULL DEFAULT 10,
       enabled BOOLEAN NOT NULL DEFAULT true,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       CONSTRAINT tournament_config_singleton CHECK (id = 1)
@@ -4142,20 +4141,79 @@ async function initTournamentTables() {
   `);
 
   await db.query(`
-    INSERT INTO tournament_config (id, prize_amount, enabled)
-    VALUES (1, 10, true)
+    INSERT INTO tournament_config (id, enabled)
+    VALUES (1, true)
     ON CONFLICT (id) DO NOTHING
   `);
 
   await db.query(`
+    CREATE TABLE IF NOT EXISTS tournament_tiers (
+      id BIGSERIAL PRIMARY KEY,
+      rank_from INTEGER NOT NULL,
+      rank_to INTEGER NOT NULL,
+      amount NUMERIC(20,8) NOT NULL,
+      CHECK (rank_from >= 1 AND rank_to >= rank_from AND amount >= 0)
+    )
+  `);
+
+  const tierCount = await db.query(`SELECT COUNT(*)::int AS n FROM tournament_tiers`);
+  if (tierCount.rows[0].n === 0) {
+    // Default weekly free-play prize ladder — top 1 to top 50, $500 total.
+    // Fully editable afterwards from the admin panel.
+    await db.query(`
+      INSERT INTO tournament_tiers (rank_from, rank_to, amount) VALUES
+        (1,  1,  110),
+        (2,  2,  60),
+        (3,  3,  40),
+        (4,  5,  20),
+        (6,  10, 12),
+        (11, 20, 7),
+        (21, 35, 5),
+        (36, 50, 3)
+    `);
+  }
+
+  // Migrate the old monthly/paid-match tournament_winners table (if it still
+  // has the old shape from before this became a weekly free-play tournament)
+  // to the new one-row-per-rank-per-week shape.
+  await db.query(`
     CREATE TABLE IF NOT EXISTS tournament_winners (
       id BIGSERIAL PRIMARY KEY,
-      period TEXT UNIQUE NOT NULL,
+      period TEXT NOT NULL,
       user_id INTEGER NOT NULL REFERENCES users(id),
-      games_played INTEGER NOT NULL,
+      rank INTEGER NOT NULL,
+      wins INTEGER NOT NULL,
       prize_amount NUMERIC(20,8) NOT NULL,
       paid_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `);
+  await db.query(`
+    ALTER TABLE tournament_winners DROP CONSTRAINT IF EXISTS tournament_winners_period_key
+  `);
+  await db.query(`
+    ALTER TABLE tournament_winners ADD COLUMN IF NOT EXISTS rank INTEGER
+  `);
+  await db.query(`
+    ALTER TABLE tournament_winners ADD COLUMN IF NOT EXISTS wins INTEGER
+  `);
+  await db.query(`
+    UPDATE tournament_winners SET rank = 1 WHERE rank IS NULL
+  `);
+  await db.query(`
+    UPDATE tournament_winners SET wins = games_played WHERE wins IS NULL AND games_played IS NOT NULL
+  `);
+  await db.query(`
+    UPDATE tournament_winners SET wins = 0 WHERE wins IS NULL
+  `);
+  await db.query(`
+    ALTER TABLE tournament_winners ALTER COLUMN rank SET NOT NULL
+  `);
+  await db.query(`
+    ALTER TABLE tournament_winners ALTER COLUMN wins SET NOT NULL
+  `);
+  await db.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS tournament_winners_period_user_idx
+    ON tournament_winners(period, user_id)
   `);
 }
 
@@ -4214,38 +4272,74 @@ app.get('/api/admin/visits', adminOnly, async (req, res) => {
   }
 });
 
-function monthPeriodString(d) {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  return y + '-' + m;
+// ISO week period string, e.g. "2026-W34"
+function weekPeriodString(d) {
+  const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dayNum = (date.getUTCDay() + 6) % 7; // Monday=0 .. Sunday=6
+  date.setUTCDate(date.getUTCDate() - dayNum + 3); // nearest Thursday
+  const firstThursday = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
+  const weekNum = 1 + Math.round(
+    ((date.getTime() - firstThursday.getTime()) / 86400000 - 3 + ((firstThursday.getUTCDay() + 6) % 7)) / 7
+  );
+  return date.getUTCFullYear() + '-W' + String(weekNum).padStart(2, '0');
 }
 
-function monthBounds(periodStr) {
-  const [y, m] = periodStr.split('-').map(Number);
-  const start = new Date(Date.UTC(y, m - 1, 1, 0, 0, 0));
-  const end = new Date(Date.UTC(y, m, 1, 0, 0, 0));
+function weekBounds(periodStr) {
+  const [yStr, wStr] = periodStr.split('-W');
+  const y = Number(yStr), w = Number(wStr);
+  const jan4 = new Date(Date.UTC(y, 0, 4));
+  const jan4Day = (jan4.getUTCDay() + 6) % 7; // Monday=0
+  const week1Monday = new Date(jan4.getTime() - jan4Day * 86400000);
+  const start = new Date(week1Monday.getTime() + (w - 1) * 7 * 86400000);
+  const end = new Date(start.getTime() + 7 * 86400000);
   return { start, end };
 }
 
-async function getLeaderboardForPeriod(periodStr, limit) {
-  const { start, end } = monthBounds(periodStr);
+function currentWeekPeriod() {
+  return weekPeriodString(new Date());
+}
+
+function previousWeekPeriod() {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - 7);
+  return weekPeriodString(d);
+}
+
+async function getTiers() {
   const result = await db.query(`
-    SELECT u.id, u.email, x.games_played
+    SELECT rank_from, rank_to, amount
+    FROM tournament_tiers
+    ORDER BY rank_from ASC
+  `);
+  return result.rows.map(r => ({
+    rank_from: Number(r.rank_from),
+    rank_to: Number(r.rank_to),
+    amount: Number(r.amount)
+  }));
+}
+
+function tierAmountForRank(tiers, rank) {
+  const t = tiers.find(t => rank >= t.rank_from && rank <= t.rank_to);
+  return t ? t.amount : 0;
+}
+
+// Leaderboard = most WINS in settled FREE matches (stake=0) within the week.
+async function getLeaderboardForPeriod(periodStr, limit) {
+  const { start, end } = weekBounds(periodStr);
+  const result = await db.query(`
+    SELECT u.id, u.email, x.wins
     FROM (
-      SELECT user_id, COUNT(*) AS games_played
-      FROM (
-        SELECT p1_user_id AS user_id FROM paid_matches
-          WHERE status='settled' AND settled_at >= $1 AND settled_at < $2
-        UNION ALL
-        SELECT p2_user_id AS user_id FROM paid_matches
-          WHERE status='settled' AND settled_at >= $1 AND settled_at < $2
-      ) games
-      GROUP BY user_id
+      SELECT winner_user_id AS user_id, COUNT(*) AS wins
+      FROM paid_matches
+      WHERE status='settled' AND stake=0
+        AND winner_user_id IS NOT NULL
+        AND settled_at >= $1 AND settled_at < $2
+      GROUP BY winner_user_id
     ) x
     JOIN users u ON u.id = x.user_id
-    ORDER BY x.games_played DESC, u.id ASC
+    ORDER BY x.wins DESC, u.id ASC
     LIMIT $3
-  `, [start, end, limit || 20]);
+  `, [start, end, limit || 50]);
   return result.rows;
 }
 
@@ -4253,52 +4347,57 @@ async function checkAndPayoutTournament() {
   try {
     const cfg = await db.query(`SELECT * FROM tournament_config WHERE id=1`);
     if (!cfg.rows.length || !cfg.rows[0].enabled) return;
-    const prizeAmount = Number(cfg.rows[0].prize_amount || 0);
-    if (!(prizeAmount > 0)) return;
 
-    const now = new Date();
-    const prevMonthDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-    const period = monthPeriodString(prevMonthDate);
+    const period = previousWeekPeriod();
 
     const already = await db.query(
-      `SELECT id FROM tournament_winners WHERE period=$1`, [period]
+      `SELECT id FROM tournament_winners WHERE period=$1 LIMIT 1`, [period]
     );
     if (already.rows.length) return;
 
-    const leaderboard = await getLeaderboardForPeriod(period, 1);
-    if (!leaderboard.length || Number(leaderboard[0].games_played) <= 0) return;
+    const tiers = await getTiers();
+    if (!tiers.length) return;
 
-    const winnerId = leaderboard[0].id;
-    const gamesPlayed = Number(leaderboard[0].games_played);
+    const maxRank = Math.max(...tiers.map(t => t.rank_to));
+    const leaderboard = await getLeaderboardForPeriod(period, maxRank);
+    if (!leaderboard.length) return;
 
     const client = await db.pool.connect();
     try {
       await client.query('BEGIN');
-      const locked = await client.query(
-        `SELECT id, balance FROM users WHERE id=$1 FOR UPDATE`, [winnerId]
-      );
-      if (!locked.rows.length) { await client.query('ROLLBACK'); return; }
-      const before = Number(locked.rows[0].balance || 0);
-      const after = before + prizeAmount;
 
-      await client.query(
-        `UPDATE users SET balance=$1 WHERE id=$2`, [after, winnerId]
-      );
-      await client.query(`
-        INSERT INTO admin_balance_audit
-          (user_id, amount, balance_before, balance_after, reason)
-        VALUES ($1,$2,$3,$4,$5)
-      `, [winnerId, prizeAmount, before, after,
-        'Monthly tournament prize for ' + period + ' (' + gamesPlayed + ' games played)']);
+      for (let i = 0; i < leaderboard.length; i++) {
+        const rank = i + 1;
+        const amount = tierAmountForRank(tiers, rank);
+        if (!(amount > 0)) continue;
 
-      await client.query(`
-        INSERT INTO tournament_winners (period, user_id, games_played, prize_amount)
-        VALUES ($1,$2,$3,$4)
-        ON CONFLICT (period) DO NOTHING
-      `, [period, winnerId, gamesPlayed, prizeAmount]);
+        const row = leaderboard[i];
+        const locked = await client.query(
+          `SELECT id, balance FROM users WHERE id=$1 FOR UPDATE`, [row.id]
+        );
+        if (!locked.rows.length) continue;
+        const before = Number(locked.rows[0].balance || 0);
+        const after = before + amount;
+
+        await client.query(
+          `UPDATE users SET balance=$1 WHERE id=$2`, [after, row.id]
+        );
+        await client.query(`
+          INSERT INTO admin_balance_audit
+            (user_id, amount, balance_before, balance_after, reason)
+          VALUES ($1,$2,$3,$4,$5)
+        `, [row.id, amount, before, after,
+          'Weekly free-play tournament prize for ' + period + ' (rank #' + rank + ', ' + row.wins + ' wins)']);
+
+        await client.query(`
+          INSERT INTO tournament_winners (period, user_id, rank, wins, prize_amount)
+          VALUES ($1,$2,$3,$4,$5)
+          ON CONFLICT (period, user_id) DO NOTHING
+        `, [period, row.id, rank, Number(row.wins), amount]);
+      }
 
       await client.query('COMMIT');
-      console.log('Tournament prize paid for ' + period + ' to user ' + winnerId);
+      console.log('Weekly tournament paid out for ' + period);
     } catch (e) {
       try { await client.query('ROLLBACK'); } catch {}
       console.error('tournament payout error:', e.message);
@@ -4312,17 +4411,23 @@ async function checkAndPayoutTournament() {
 
 app.get('/api/tournament/leaderboard', async (req, res) => {
   try {
-    const cfg = await db.query(`SELECT prize_amount, enabled FROM tournament_config WHERE id=1`);
-    const period = monthPeriodString(new Date());
-    const leaderboard = await getLeaderboardForPeriod(period, 20);
+    const cfg = await db.query(`SELECT enabled FROM tournament_config WHERE id=1`);
+    const tiers = await getTiers();
+    const totalPool = tiers.reduce((s, t) => s + t.amount * (t.rank_to - t.rank_from + 1), 0);
+    const period = currentWeekPeriod();
+    const maxRank = tiers.length ? Math.max(...tiers.map(t => t.rank_to)) : 50;
+    const leaderboard = await getLeaderboardForPeriod(period, maxRank);
     res.json({
       period,
-      prize_amount: Number(cfg.rows[0]?.prize_amount || 0),
+      total_pool: totalPool,
+      top_prize: tiers.length ? tierAmountForRank(tiers, 1) : 0,
       enabled: !!cfg.rows[0]?.enabled,
-      leaderboard: leaderboard.map(r => ({
+      leaderboard: leaderboard.map((r, i) => ({
         user_id: r.id,
         email: r.email,
-        games_played: Number(r.games_played)
+        wins: Number(r.wins),
+        rank: i + 1,
+        prize_amount: tierAmountForRank(tiers, i + 1)
       }))
     });
   } catch (e) {
@@ -4333,30 +4438,40 @@ app.get('/api/tournament/leaderboard', async (req, res) => {
 
 app.get('/api/admin/tournament', adminOnly, async (req, res) => {
   try {
-    const cfg = await db.query(`SELECT prize_amount, enabled FROM tournament_config WHERE id=1`);
-    const period = monthPeriodString(new Date());
-    const leaderboard = await getLeaderboardForPeriod(period, 50);
+    const cfg = await db.query(`SELECT enabled FROM tournament_config WHERE id=1`);
+    const tiers = await getTiers();
+    const totalPool = tiers.reduce((s, t) => s + t.amount * (t.rank_to - t.rank_from + 1), 0);
+    const period = currentWeekPeriod();
+    const maxRank = tiers.length ? Math.max(...tiers.map(t => t.rank_to)) : 50;
+    const leaderboard = await getLeaderboardForPeriod(period, maxRank);
     const winners = await db.query(`
-      SELECT tw.period, tw.user_id, u.email, tw.games_played, tw.prize_amount, tw.paid_at
+      SELECT tw.period, tw.user_id, u.email, tw.rank, tw.wins, tw.prize_amount, tw.paid_at
       FROM tournament_winners tw
       JOIN users u ON u.id = tw.user_id
-      ORDER BY tw.period DESC
-      LIMIT 24
+      ORDER BY tw.period DESC, tw.rank ASC
+      LIMIT 200
     `);
     res.json({
       period,
-      prize_amount: Number(cfg.rows[0]?.prize_amount || 0),
+      total_pool: totalPool,
       enabled: !!cfg.rows[0]?.enabled,
-      leaderboard: leaderboard.map(r => ({
+      tiers: tiers.map((t, i) => ({ id_index: i, ...t })),
+      tiers_raw: (await db.query(`SELECT id, rank_from, rank_to, amount FROM tournament_tiers ORDER BY rank_from ASC`)).rows.map(r => ({
+        id: r.id, rank_from: Number(r.rank_from), rank_to: Number(r.rank_to), amount: Number(r.amount)
+      })),
+      leaderboard: leaderboard.map((r, i) => ({
         user_id: r.id,
         email: r.email,
-        games_played: Number(r.games_played)
+        wins: Number(r.wins),
+        rank: i + 1,
+        prize_amount: tierAmountForRank(tiers, i + 1)
       })),
       winners: winners.rows.map(w => ({
         period: w.period,
         user_id: w.user_id,
         email: w.email,
-        games_played: Number(w.games_played),
+        rank: w.rank,
+        wins: Number(w.wins),
         prize_amount: Number(w.prize_amount),
         paid_at: w.paid_at
       }))
@@ -4369,21 +4484,72 @@ app.get('/api/admin/tournament', adminOnly, async (req, res) => {
 
 app.post('/api/admin/tournament/config', adminOnly, async (req, res) => {
   try {
-    const prizeAmount = Number(req.body?.prize_amount);
     const enabled = req.body?.enabled;
-    if (!Number.isFinite(prizeAmount) || prizeAmount < 0) {
-      return res.status(400).json({ error: 'valid_prize_amount_required' });
-    }
     await db.query(`
       UPDATE tournament_config
-      SET prize_amount=$1,
-          enabled=COALESCE($2, enabled),
+      SET enabled=COALESCE($1, enabled),
           updated_at=NOW()
       WHERE id=1
-    `, [prizeAmount, typeof enabled === 'boolean' ? enabled : null]);
-    res.json({ ok: true, prize_amount: prizeAmount });
+    `, [typeof enabled === 'boolean' ? enabled : null]);
+    res.json({ ok: true });
   } catch (e) {
     console.error('tournament config error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/tournament/tiers', adminOnly, async (req, res) => {
+  try {
+    const { rank_from, rank_to, amount } = req.body || {};
+    const rf = Number(rank_from), rt = Number(rank_to), amt = Number(amount);
+    if (!Number.isInteger(rf) || !Number.isInteger(rt) || rf < 1 || rt < rf) {
+      return res.status(400).json({ error: 'invalid_rank_range' });
+    }
+    if (!Number.isFinite(amt) || amt < 0) {
+      return res.status(400).json({ error: 'invalid_amount' });
+    }
+    const result = await db.query(`
+      INSERT INTO tournament_tiers (rank_from, rank_to, amount)
+      VALUES ($1,$2,$3)
+      RETURNING id, rank_from, rank_to, amount
+    `, [rf, rt, amt]);
+    res.json({ ok: true, tier: result.rows[0] });
+  } catch (e) {
+    console.error('tournament tier add error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/tournament/tiers/:id', adminOnly, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const { rank_from, rank_to, amount } = req.body || {};
+    const rf = Number(rank_from), rt = Number(rank_to), amt = Number(amount);
+    if (!Number.isInteger(rf) || !Number.isInteger(rt) || rf < 1 || rt < rf) {
+      return res.status(400).json({ error: 'invalid_rank_range' });
+    }
+    if (!Number.isFinite(amt) || amt < 0) {
+      return res.status(400).json({ error: 'invalid_amount' });
+    }
+    await db.query(`
+      UPDATE tournament_tiers
+      SET rank_from=$1, rank_to=$2, amount=$3
+      WHERE id=$4
+    `, [rf, rt, amt, id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('tournament tier update error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/tournament/tiers/:id/delete', adminOnly, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    await db.query(`DELETE FROM tournament_tiers WHERE id=$1`, [id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('tournament tier delete error:', e.message);
     res.status(500).json({ error: 'server_error' });
   }
 });
