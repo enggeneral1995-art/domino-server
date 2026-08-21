@@ -5806,6 +5806,29 @@ app.post(
           ]
         );
 
+      if (result === 'win') {
+        // Also count vs-Computer wins toward the weekly Free Play
+        // tournament leaderboard, same as wins against real opponents.
+        try {
+          const roomId =
+            'bot-' + req.user.id + '-' + Date.now() + '-' +
+            Math.random().toString(36).slice(2, 8);
+
+          await db.query(
+            `
+            INSERT INTO paid_matches
+              (room_id, p1_user_id, p2_user_id, stake, prize,
+               status, winner_user_id, settled_at)
+            VALUES
+              ($1, $2, $2, 0, 0, 'settled', $2, NOW())
+            `,
+            [roomId, req.user.id]
+          );
+        } catch (e) {
+          console.warn('bot-win tournament record skipped:', e.message);
+        }
+      }
+
       res.json({
         user:
           publicUser(
