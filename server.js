@@ -6333,7 +6333,7 @@ io.on(
           let userId =
             null;
 
-          if (!isFree) {
+          {
             const payload =
               verifyMatchToken(
                 options.token
@@ -6353,7 +6353,9 @@ io.on(
               Number(
                 payload.id
               );
+          }
 
+          if (!isFree) {
             const result =
               await db.query(
                 `
@@ -6475,36 +6477,34 @@ io.on(
             let paidMatch =
               null;
 
-            if (!isFree) {
-              try {
-                paidMatch =
-                  await reservePaidEntries(
-                    roomId,
-                    waiting.userId,
-                    userId,
-                    stake,
-                    prize
-                  );
-
-              } catch (e) {
-                const error =
-                  e.message ===
-                  'insufficient_balance'
-                    ? 'insufficient_balance'
-                    : 'match_reservation_failed';
-
-                emitMatchError(
-                  player1,
-                  error
+            try {
+              paidMatch =
+                await reservePaidEntries(
+                  roomId,
+                  waiting.userId,
+                  userId,
+                  stake,
+                  prize
                 );
 
-                emitMatchError(
-                  player2,
-                  error
-                );
+            } catch (e) {
+              const error =
+                e.message ===
+                'insufficient_balance'
+                  ? 'insufficient_balance'
+                  : 'match_reservation_failed';
 
-                return;
-              }
+              emitMatchError(
+                player1,
+                error
+              );
+
+              emitMatchError(
+                player2,
+                error
+              );
+
+              return;
             }
 
             const room = {
@@ -6526,16 +6526,10 @@ io.on(
                     )
                   : null,
 
-              userIds:
-                isFree
-                  ? [
-                      null,
-                      null
-                    ]
-                  : [
-                      waiting.userId,
-                      userId
-                    ],
+              userIds: [
+                waiting.userId,
+                userId
+              ],
 
               moves:
                 0,
@@ -6843,8 +6837,7 @@ io.on(
 
           if (
             !room ||
-            !room.matchId ||
-            room.stake <= 0
+            !room.matchId
           ) {
             return;
           }
@@ -7175,16 +7168,19 @@ io.on(
             roomId
           );
 
-          const hasPaidMatch =
+          const hasTrackedMatch =
             room.matchId &&
             room.userIds &&
             room.userIds[0] &&
             room.userIds[1];
 
-          if (hasPaidMatch) {
-            // The disconnecting player forfeits this match; the remaining
-            // player is credited the win (and prize) automatically instead
-            // of the board just sitting frozen forever.
+          if (hasTrackedMatch) {
+            // The disconnecting player forfeits this match (win/loss and,
+            // for paid matches, the prize too); the remaining player is
+            // credited automatically instead of the board just sitting
+            // frozen forever or the innocent player being kicked to the
+            // lobby with nothing. Applies to both paid and free matches now
+            // that free matches also get a real match record.
             const seatIdx =
               room.players[0] === socket.id ? 0 : 1;
             const loserUserId = room.userIds[seatIdx];
