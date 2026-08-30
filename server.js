@@ -2891,9 +2891,6 @@ app.post(
               },
 
               body: {
-                payout_description:
-                  'Yalla Domino withdrawal',
-
                 ipn_callback_url:
                   NOWPAYMENTS_IPN_URL,
 
