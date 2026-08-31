@@ -1522,6 +1522,56 @@ async function initAppConfig() {
   `);
 }
 
+/* =========================================================
+   GLOBAL CHAT — PERSISTENCE
+   Stores messages sent in the public lobby chat so people who
+   open the app later can see recent history, not just live
+   messages sent after they connect.
+========================================================= */
+
+async function initGlobalChatTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS global_chat_messages (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      name TEXT NOT NULL,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS global_chat_messages_created_idx
+    ON global_chat_messages(created_at DESC)
+  `);
+}
+
+// Public — no auth required, so the chat panel can show recent history
+// even before/while the person is signing in. Only sending a message
+// requires being logged in (checked in the socket handler).
+app.get('/api/global-chat/history', async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT user_id, name, text, created_at
+      FROM global_chat_messages
+      WHERE created_at > NOW() - INTERVAL '12 hours'
+      ORDER BY created_at ASC
+      LIMIT 200
+    `);
+
+    res.json({
+      messages: result.rows.map(row => ({
+        userId: row.user_id,
+        name: row.name,
+        text: row.text,
+        ts: new Date(row.created_at).getTime()
+      }))
+    });
+  } catch (e) {
+    console.error('global-chat/history error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 async function isPaidEnabled() {
   try {
     const result = await db.query(`SELECT paid_enabled FROM app_config WHERE id=1`);
@@ -7638,6 +7688,29 @@ io.on(
               result.rows[0]
             );
 
+          // Persist so the /api/global-chat/history endpoint can show
+          // it to people who open the app later (best-effort — a save
+          // failure shouldn't block the live broadcast below).
+          try {
+            await db.query(
+              `
+              INSERT INTO global_chat_messages
+                (user_id, name, text)
+              VALUES ($1, $2, $3)
+              `,
+              [
+                tokenPayload.id,
+                name,
+                text
+              ]
+            );
+          } catch (e) {
+            console.error(
+              'global_chat_messages insert error:',
+              e.message
+            );
+          }
+
           io.emit(
             'global_chat_message',
             {
@@ -8092,6 +8165,14 @@ const PORT =
   process.env.PORT ||
   3000;
 
+// Keep the global_chat_messages table from growing forever — the history
+// endpoint only ever looks back 12 hours, so anything older is dead
+// weight. Runs hourly, deletes anything past a day old.
+setInterval(() => {
+  db.query(`DELETE FROM global_chat_messages WHERE created_at < NOW() - INTERVAL '1 day'`)
+    .catch(e => console.error('global_chat_messages cleanup error:', e.message));
+}, 60 * 60 * 1000);
+
 async function startServer() {
   try {
     await db.init();
@@ -8111,6 +8192,8 @@ async function startServer() {
     await db.query(`UPDATE tournament_config SET fake_reset_period=NULL WHERE id=1`);
 
     await initVisitTables();
+
+    await initGlobalChatTable();
 
     await initAppConfig();
 
