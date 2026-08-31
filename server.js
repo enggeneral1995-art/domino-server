@@ -1558,7 +1558,7 @@ const MIN_DEPOSIT =
   Number(
     process.env
       .USDT_MIN_DEPOSIT ||
-    15
+    5
   );
 
 const MIN_WITHDRAW =
@@ -1893,7 +1893,7 @@ app.post(
           .status(400)
           .json({
             error:
-              'minimum_deposit_is_15_usdt',
+              'minimum_deposit_is_' + MIN_DEPOSIT + '_usdt',
 
             min:
               MIN_DEPOSIT
