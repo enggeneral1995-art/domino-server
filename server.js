@@ -107,12 +107,15 @@ function verifyNowPaymentsIpn(body, receivedSig, rawBody) {
   }
 
   let canonical;
+  let usedRawBody = false;
 
   try {
-    canonical =
-      rawBody
-        ? canonicalizeNowPaymentsPayload(rawBody)
-        : JSON.stringify(sortObjectDeep(body || {}));
+    if (rawBody) {
+      canonical = canonicalizeNowPaymentsPayload(rawBody);
+      usedRawBody = true;
+    } else {
+      canonical = JSON.stringify(sortObjectDeep(body || {}));
+    }
   } catch (e) {
     canonical =
       JSON.stringify(sortObjectDeep(body || {}));
@@ -141,10 +144,19 @@ function verifyNowPaymentsIpn(body, receivedSig, rawBody) {
       'utf8'
     );
 
-  return (
+  const match =
     a.length === b.length &&
-    crypto.timingSafeEqual(a, b)
+    crypto.timingSafeEqual(a, b);
+
+  console.log(
+    '[nowpayments_ipn] sig-check usedRawBody=' + usedRawBody +
+    ' rawBodyLen=' + (rawBody ? rawBody.length : 0) +
+    ' expected=' + expected.slice(0, 12) + '...' +
+    ' received=' + String(receivedSig).slice(0, 12) + '...' +
+    ' match=' + match
   );
+
+  return match;
 }
 
 async function nowPaymentsRequest(
