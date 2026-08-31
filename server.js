@@ -7744,6 +7744,10 @@ async function startServer() {
           'Domino server running on port ' +
           PORT
         );
+        console.log(
+          'MIN_DEPOSIT effective value: ' + MIN_DEPOSIT +
+          ' (from env USDT_MIN_DEPOSIT=' + (process.env.USDT_MIN_DEPOSIT || '<not set>') + ')'
+        );
       }
     );
 
