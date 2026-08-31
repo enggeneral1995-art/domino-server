@@ -3686,6 +3686,10 @@ app.get(
 
           WHERE
             user_id=$1
+            AND (
+              (type='deposit' AND status='confirmed')
+              OR (type='withdraw' AND status='completed')
+            )
 
           ORDER BY
             created_at DESC
