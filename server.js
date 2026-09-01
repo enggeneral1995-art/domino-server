@@ -1732,7 +1732,6 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
 
 const USDT_NETWORKS =
   new Set([
-    'TRC20',
     'BEP20',
     'ERC20'
   ]);
