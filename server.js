@@ -37,6 +37,30 @@ const NOWPAYMENTS_IPN_URL =
   process.env.NOWPAYMENTS_IPN_URL ||
   'https://domino-server-production-dcd7.up.railway.app/api/nowpayments/ipn';
 
+const TELEGRAM_BOT_TOKEN =
+  process.env.TELEGRAM_BOT_TOKEN || '';
+
+// Bot's @username, without the @ (e.g. "YallaDominoBot")
+const TELEGRAM_BOT_USERNAME =
+  process.env.TELEGRAM_BOT_USERNAME || '';
+
+// The channel people must join — either "@channelusername" or the
+// numeric chat id (e.g. "-1001234567890"); the bot must be an admin
+// of this channel or it can't check membership.
+const TELEGRAM_CHANNEL_ID =
+  process.env.TELEGRAM_CHANNEL_ID || '';
+
+const TELEGRAM_JOIN_BONUS_AMOUNT =
+  Number(
+    process.env.TELEGRAM_JOIN_BONUS_AMOUNT || 0.50
+  );
+
+// Matched against Telegram's X-Telegram-Bot-Api-Secret-Token header
+// (set this same value when calling setWebhook) so randoms can't POST
+// fake "the user joined" updates to this endpoint.
+const TELEGRAM_WEBHOOK_SECRET =
+  process.env.TELEGRAM_WEBHOOK_SECRET || '';
+
 const NOWPAYMENTS_API_BASE =
   'https://api.nowpayments.io/v1';
 
@@ -231,6 +255,73 @@ async function nowPaymentsRequest(
 
   return data;
 }
+
+/* =========================================================
+   TELEGRAM — join-channel bonus
+========================================================= */
+
+async function telegramApi(
+  method,
+  params
+) {
+  if (!TELEGRAM_BOT_TOKEN) {
+    throw new Error(
+      'telegram_bot_token_missing'
+    );
+  }
+
+  const response =
+    await fetch(
+      'https://api.telegram.org/bot' +
+        TELEGRAM_BOT_TOKEN +
+        '/' + method,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(params || {})
+      }
+    );
+
+  return response.json();
+}
+
+async function telegramSendMessage(
+  chatId,
+  text
+) {
+  try {
+    await telegramApi(
+      'sendMessage',
+      {
+        chat_id: chatId,
+        text
+      }
+    );
+  } catch (e) {
+    console.error(
+      'telegram sendMessage error:',
+      e.message
+    );
+  }
+}
+
+// token -> { userId, expiresAt } — short-lived, created when a user
+// requests their join link, consumed by the bot webhook once the
+// person presses Start. In-memory is fine: worst case on a restart
+// is someone has to tap the button again.
+const pendingTelegramJoinTokens =
+  new Map();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of pendingTelegramJoinTokens) {
+    if (entry.expiresAt < now) {
+      pendingTelegramJoinTokens.delete(token);
+    }
+  }
+}, 10 * 60 * 1000);
 
 async function getNowPaymentsJwt() {
   if (
@@ -1572,6 +1663,221 @@ app.get('/api/global-chat/history', async (req, res) => {
   }
 });
 
+/* =========================================================
+   TELEGRAM JOIN BONUS
+   Person taps a button in the app -> gets a personal deep link to
+   our bot -> opens Telegram, joins the channel if needed, presses
+   Start -> the bot webhook below verifies membership via the
+   Telegram Bot API and credits the bonus once per account.
+========================================================= */
+
+async function initTelegramJoinTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS telegram_join_claims (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      telegram_user_id BIGINT,
+      claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+app.get(
+  '/api/telegram/join-link',
+  auth,
+  async (req, res) => {
+    try {
+      if (
+        !TELEGRAM_BOT_USERNAME ||
+        !TELEGRAM_CHANNEL_ID
+      ) {
+        return res
+          .status(500)
+          .json({
+            error: 'telegram_not_configured'
+          });
+      }
+
+      const already =
+        await db.query(
+          `SELECT 1 FROM telegram_join_claims WHERE user_id=$1`,
+          [req.user.id]
+        );
+
+      if (already.rows.length) {
+        return res.json({
+          alreadyClaimed: true,
+          amount: TELEGRAM_JOIN_BONUS_AMOUNT
+        });
+      }
+
+      const token =
+        crypto
+          .randomBytes(16)
+          .toString('hex');
+
+      pendingTelegramJoinTokens.set(
+        token,
+        {
+          userId: req.user.id,
+          expiresAt: Date.now() + 30 * 60 * 1000
+        }
+      );
+
+      res.json({
+        link:
+          'https://t.me/' +
+          TELEGRAM_BOT_USERNAME +
+          '?start=' + token,
+        amount: TELEGRAM_JOIN_BONUS_AMOUNT
+      });
+
+    } catch (e) {
+      console.error('telegram/join-link error:', e.message);
+      res.status(500).json({ error: 'server_error' });
+    }
+  }
+);
+
+app.post(
+  '/api/telegram/webhook',
+  async (req, res) => {
+    try {
+      if (TELEGRAM_WEBHOOK_SECRET) {
+        const got =
+          req.headers['x-telegram-bot-api-secret-token'];
+
+        if (got !== TELEGRAM_WEBHOOK_SECRET) {
+          return res.status(401).end();
+        }
+      }
+
+      const msg =
+        req.body && req.body.message;
+
+      if (
+        !msg ||
+        typeof msg.text !== 'string'
+      ) {
+        return res.json({ ok: true });
+      }
+
+      const chatId =
+        msg.chat && msg.chat.id;
+
+      const fromId =
+        msg.from && msg.from.id;
+
+      const match =
+        msg.text.match(
+          /^\/start(?:\s+(\S+))?/
+        );
+
+      if (!match) {
+        return res.json({ ok: true });
+      }
+
+      const startToken = match[1];
+
+      if (!startToken) {
+        await telegramSendMessage(
+          chatId,
+          'سڵاو! تکایە لە ناو ئەپی Yalla Domino دوگمەی بۆنووسی بەشداریبوون بکەرەوە بۆ وەرگرتنی ئەم لینکە.'
+        );
+        return res.json({ ok: true });
+      }
+
+      const claim =
+        pendingTelegramJoinTokens.get(
+          startToken
+        );
+
+      if (
+        !claim ||
+        claim.expiresAt < Date.now()
+      ) {
+        await telegramSendMessage(
+          chatId,
+          'ئەم لینکە بەسەرچووە. تکایە دووبارە لە ئەپەکەوە هەوڵبدەرەوە.'
+        );
+        return res.json({ ok: true });
+      }
+
+      const already =
+        await db.query(
+          `SELECT 1 FROM telegram_join_claims WHERE user_id=$1`,
+          [claim.userId]
+        );
+
+      if (already.rows.length) {
+        await telegramSendMessage(
+          chatId,
+          'تۆ پێشتر ئەم خەڵاتەت وەرگرتووە. سوپاس بۆ بەشداریت!'
+        );
+        pendingTelegramJoinTokens.delete(startToken);
+        return res.json({ ok: true });
+      }
+
+      const memberResp =
+        await telegramApi(
+          'getChatMember',
+          {
+            chat_id: TELEGRAM_CHANNEL_ID,
+            user_id: fromId
+          }
+        );
+
+      const status =
+        memberResp &&
+        memberResp.result &&
+        memberResp.result.status;
+
+      const isMember =
+        ['member', 'administrator', 'creator']
+          .includes(status);
+
+      if (!isMember) {
+        await telegramSendMessage(
+          chatId,
+          'سەرەتا پەیوەست بە چەناڵەکەمان بکە، پاشان دووبارە /start بنێرە.'
+        );
+        return res.json({ ok: true });
+      }
+
+      await db.query(
+        `
+        INSERT INTO telegram_join_claims
+          (user_id, telegram_user_id)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id) DO NOTHING
+        `,
+        [claim.userId, fromId]
+      );
+
+      await db.query(
+        `UPDATE users SET balance = balance + $1 WHERE id=$2`,
+        [TELEGRAM_JOIN_BONUS_AMOUNT, claim.userId]
+      );
+
+      pendingTelegramJoinTokens.delete(startToken);
+
+      await telegramSendMessage(
+        chatId,
+        'سوپاس بۆ بەشداریت! USDT ' +
+          TELEGRAM_JOIN_BONUS_AMOUNT.toFixed(2) +
+          ' زیادکرا بۆ ئەکاونتەکەت لە یاری Yalla Domino. 🎉'
+      );
+
+      res.json({ ok: true });
+
+    } catch (e) {
+      console.error('telegram webhook error:', e.message);
+      // Always 200 back to Telegram — a non-200 makes it retry the
+      // same update repeatedly.
+      res.json({ ok: true });
+    }
+  }
+);
+
 async function isPaidEnabled() {
   try {
     const result = await db.query(`SELECT paid_enabled FROM app_config WHERE id=1`);
@@ -2113,8 +2419,16 @@ app.post(
               order_description:
                 'Yalla Domino USDT deposit',
 
+              // Fixed-rate locks an exact target amount for a short
+              // window; sending noticeably more than that target was
+              // observed to push the whole payment to NOWPayments'
+              // "Failed" status instead of crediting the difference
+              // (confirmed by their support team for payment
+              // 5595980686). Floating rate tolerates over/under
+              // payment far better — we already credit whatever
+              // actually_paid comes back in the IPN handler either way.
               is_fixed_rate:
-                true,
+                false,
 
               is_fee_paid_by_user:
                 false
@@ -8195,6 +8509,8 @@ async function startServer() {
     await initVisitTables();
 
     await initGlobalChatTable();
+
+    await initTelegramJoinTable();
 
     await initAppConfig();
 
