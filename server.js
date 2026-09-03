@@ -4743,6 +4743,31 @@ app.get('/api/admin/visits', adminOnly, async (req, res) => {
   }
 });
 
+// Today's match counts, split free (stake=0) vs paid (stake>0). A plain
+// COUNT(*) query rather than reading from the capped 200-row
+// /api/admin/matches list, so this stays accurate as volume grows past
+// that cap. "Today" is the current UTC calendar day (matches
+// paid_matches.created_at, which is stored in UTC by Postgres NOW()).
+app.get('/api/admin/matches/today', adminOnly, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE stake = 0) AS free_count,
+        COUNT(*) FILTER (WHERE stake > 0) AS paid_count
+      FROM paid_matches
+      WHERE created_at >= date_trunc('day', NOW())
+    `);
+    const row = result.rows[0] || {};
+    res.json({
+      free: Number(row.free_count || 0),
+      paid: Number(row.paid_count || 0)
+    });
+  } catch (e) {
+    console.error('admin matches/today error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // ISO week period string, e.g. "2026-W34"
 function weekPeriodString(d) {
   const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
