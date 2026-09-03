@@ -1113,6 +1113,7 @@ app.post(
 
       await updateUserLocation(user.id, req);
       recordVisit(user.id);
+      recordAppOpen();
 
       res.json({
         token:
@@ -1173,6 +1174,7 @@ app.get(
       }
 
       recordVisit(req.user.id);
+      recordAppOpen();
 
       res.json({
         user:
@@ -4705,6 +4707,16 @@ async function initVisitTables() {
     CREATE INDEX IF NOT EXISTS daily_visits_date_idx
     ON daily_visits(visit_date DESC)
   `);
+
+  // Separate from daily_visits above (which counts UNIQUE people per day):
+  // this counts every single app open/launch, including repeats from the
+  // same person on the same day — a running total, not a dedup count.
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS app_open_counts (
+      open_date DATE PRIMARY KEY,
+      opens INTEGER NOT NULL DEFAULT 0
+    )
+  `);
 }
 
 function recordVisit(userId) {
@@ -4715,6 +4727,17 @@ function recordVisit(userId) {
     VALUES (CURRENT_DATE, $1)
     ON CONFLICT (visit_date, user_id) DO NOTHING
   `, [userId]).catch(e => console.warn('recordVisit skipped:', e.message));
+}
+
+function recordAppOpen() {
+  // Fire-and-forget, same style as recordVisit — but this one has no
+  // ON CONFLICT DO NOTHING dedup: every call bumps the counter by one,
+  // so it reflects total app opens today, not unique people.
+  db.query(`
+    INSERT INTO app_open_counts (open_date, opens)
+    VALUES (CURRENT_DATE, 1)
+    ON CONFLICT (open_date) DO UPDATE SET opens = app_open_counts.opens + 1
+  `).catch(e => console.warn('recordAppOpen skipped:', e.message));
 }
 
 app.get('/api/admin/visits', adminOnly, async (req, res) => {
@@ -4730,8 +4753,12 @@ app.get('/api/admin/visits', adminOnly, async (req, res) => {
     const today = await db.query(`
       SELECT COUNT(*) AS visitors FROM daily_visits WHERE visit_date = CURRENT_DATE
     `);
+    const opensToday = await db.query(`
+      SELECT opens FROM app_open_counts WHERE open_date = CURRENT_DATE
+    `);
     res.json({
       today: Number(today.rows[0]?.visitors || 0),
+      opens_today: Number(opensToday.rows[0]?.opens || 0),
       days: result.rows.map(r => ({
         date: r.visit_date.toISOString().slice(0, 10),
         visitors: Number(r.visitors)
