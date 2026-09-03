@@ -4835,38 +4835,14 @@ async function initFakeLeaderboard() {
   `);
 }
 
-// Once per week (the first time this is called after a new week starts),
-// automatically reshuffle the seeded (fake) entries' win counts so they
-// look fresh for the new tournament period too — same as real entries
-// naturally do, without the operator needing to do anything manually.
-// Names are left untouched; only the wins numbers get re-randomized,
-// each scaled around its own previous value so the relative "leaderboard
-// feel" (who's roughly on top) stays similar week to week.
-async function maybeAutoResetFakeLeaderboard() {
-  const period = currentWeekPeriod();
-
-  // ONE atomic statement: claims this period AND zeroes every seeded
-  // entry's wins together, in the same query. There is no longer any
-  // separate "mark as done" step — if the claim succeeds, the reset
-  // happens in the very same statement, so the two can never get out of
-  // sync (previously, a claim could succeed while a later separate
-  // update failed, permanently "poisoning" that week as already-done
-  // with no actual reset ever having happened).
-  await db.query(`
-    WITH claim AS (
-      UPDATE tournament_config
-      SET fake_reset_period=$1, updated_at=NOW()
-      WHERE id=1 AND fake_reset_period IS DISTINCT FROM $1
-      RETURNING id
-    )
-    UPDATE fake_leaderboard
-    SET wins = 0
-    WHERE EXISTS (SELECT 1 FROM claim)
-  `, [period]);
-}
+// Automatic weekly reshuffling of the seeded (fake) entries' win counts
+// was removed on request — the operator adds/edits these names by hand
+// via the admin panel and wants them to stay exactly as set until changed
+// again, not get zeroed out on their own (including, apparently, in a way
+// that was also being triggered by redeploys, not just real week
+// boundaries — this removes that automatic behavior entirely either way).
 
 async function getFakeLeaderboardEntries() {
-  await maybeAutoResetFakeLeaderboard();
   const result = await db.query(`
     SELECT id, display_name, wins FROM fake_leaderboard ORDER BY wins DESC, id ASC
   `);
@@ -5258,6 +5234,65 @@ app.post('/api/admin/tournament/payout', adminOnly, async (req, res) => {
 /* =========================================================
    RESERVE PAID ENTRY
 ========================================================= */
+
+/* =========================================================
+   CREATE FREE MATCH RECORD
+   Same purpose as reservePaidEntries, but for stake=0 matches:
+   no balance to lock (nothing to reserve), so this just inserts
+   the paid_matches row directly. Without this row, a free match
+   has no matchId, and report_result falls back to only bumping
+   the player's own win/loss counters — which is why real-vs-real
+   free wins were invisible to History and the tournament
+   leaderboard (both read exclusively from paid_matches), even
+   though wins-vs-bots were already being recorded correctly via
+   their own separate insert.
+========================================================= */
+
+async function createFreeMatchRecord(
+  roomId,
+  p1UserId,
+  p2UserId
+) {
+  const result =
+    await db.query(
+      `
+      INSERT INTO
+        paid_matches
+      (
+        room_id,
+        p1_user_id,
+        p2_user_id,
+        stake,
+        prize,
+        status
+      )
+
+      VALUES
+      (
+        $1,
+        $2,
+        $3,
+        0,
+        0,
+        'active'
+      )
+
+      RETURNING
+        id,
+        room_id,
+        stake,
+        prize,
+        status
+      `,
+      [
+        roomId,
+        p1UserId,
+        p2UserId
+      ]
+    );
+
+  return result.rows[0];
+}
 
 async function reservePaidEntries(
   roomId,
@@ -7341,7 +7376,14 @@ io.on(
             // transaction — there's nothing to reserve, and running it
             // anyway only adds a DB round-trip that can fail (e.g. a
             // players_not_found edge case) and wrongly bounce two players
-            // who were correctly matched right back to the lobby.
+            // who were correctly matched right back to the lobby. They
+            // still get a lightweight paid_matches row (stake=0) so the
+            // match has a real record — otherwise a real-vs-real free win
+            // never shows up in History or the weekly tournament
+            // leaderboard, even though a win vs a bot does (that path
+            // inserts its own row separately). A failure here is non-fatal:
+            // the match still starts, it just won't be tracked for the
+            // tournament (matches the pre-fix behavior, not a regression).
             if (!isFree) {
               try {
                 paidMatch =
@@ -7379,6 +7421,22 @@ io.on(
                 );
 
                 return;
+              }
+            } else {
+              try {
+                paidMatch =
+                  await createFreeMatchRecord(
+                    roomId,
+                    effectiveWaiting.userId,
+                    userId
+                  );
+              } catch (e) {
+                console.error(
+                  '[find_match] createFreeMatchRecord failed, roomId=' + roomId +
+                  ' rawError=' + e.message
+                );
+                // Non-fatal — the free match still proceeds untracked,
+                // same as before this fix.
               }
             }
 
