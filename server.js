@@ -10,6 +10,7 @@ const { Server } = require('socket.io');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const db = require('./db');
+const nodemailer = require('nodemailer');
 
 const JWT_SECRET =
   process.env.JWT_SECRET ||
@@ -47,6 +48,63 @@ const TELEGRAM_JOIN_BONUS_AMOUNT =
   Number(
     process.env.TELEGRAM_JOIN_BONUS_AMOUNT || 0.50
   );
+
+/* =========================================================
+   PASSWORD RESET — email via Gmail SMTP
+========================================================= */
+
+// Gmail address you're sending FROM (e.g. yourteam@gmail.com)
+const SMTP_EMAIL =
+  process.env.SMTP_EMAIL || '';
+
+// The 16-character Gmail "App password" (not your normal Gmail password) —
+// generate one at myaccount.google.com/security under "App passwords"
+// (requires 2-Step Verification to be turned on first).
+const SMTP_APP_PASSWORD =
+  process.env.SMTP_APP_PASSWORD || '';
+
+const mailTransporter =
+  (SMTP_EMAIL && SMTP_APP_PASSWORD)
+    ? nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          user: SMTP_EMAIL,
+          pass: SMTP_APP_PASSWORD
+        }
+      })
+    : null;
+
+async function sendResetCodeEmail(toEmail, code) {
+  if (!mailTransporter) {
+    throw new Error('smtp_not_configured');
+  }
+
+  await mailTransporter.sendMail({
+    from: 'Yalla Domino <' + SMTP_EMAIL + '>',
+    to: toEmail,
+    subject: 'Yalla Domino — Password Reset Code',
+    text:
+      'Your password reset code is: ' + code +
+      '\n\nThis code expires in 15 minutes. If you did not request this, you can ignore this email.',
+    html:
+      '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222">' +
+      '<p>Your password reset code is:</p>' +
+      '<p style="font-size:28px;font-weight:bold;letter-spacing:4px">' + code + '</p>' +
+      '<p style="color:#666;font-size:13px">This code expires in 15 minutes. If you did not request this, you can ignore this email.</p>' +
+      '</div>'
+  });
+}
+
+async function initPasswordResetTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS password_reset_codes (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id),
+      code TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
 
 const NOWPAYMENTS_API_BASE =
   'https://api.nowpayments.io/v1';
@@ -1134,6 +1192,126 @@ app.post(
           error:
             'server_error'
         });
+    }
+  }
+);
+
+/* =========================================================
+   FORGOT PASSWORD
+========================================================= */
+
+app.post(
+  '/api/auth/forgot-password',
+  async (req, res) => {
+    try {
+      let { email } = req.body || {};
+
+      if (!email) {
+        return res.status(400).json({ error: 'email_required' });
+      }
+
+      email = String(email).trim().toLowerCase();
+
+      const result = await db.query(
+        `SELECT id FROM users WHERE email=$1`,
+        [email]
+      );
+
+      // Always respond the same way whether or not the email exists, so
+      // this endpoint can't be used to check which emails are registered.
+      if (!result.rows.length) {
+        return res.json({ ok: true });
+      }
+
+      const userId = result.rows[0].id;
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+      await db.query(
+        `
+        INSERT INTO password_reset_codes (user_id, code, expires_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id)
+        DO UPDATE SET code=$2, expires_at=$3, created_at=NOW()
+        `,
+        [userId, code, expiresAt]
+      );
+
+      try {
+        await sendResetCodeEmail(email, code);
+      } catch (mailErr) {
+        console.error('sendResetCodeEmail error:', mailErr.message);
+        return res.status(500).json({ error: 'email_send_failed' });
+      }
+
+      res.json({ ok: true });
+
+    } catch (e) {
+      console.error('forgot-password error:', e.message);
+      res.status(500).json({ error: 'server_error' });
+    }
+  }
+);
+
+app.post(
+  '/api/auth/reset-password',
+  async (req, res) => {
+    try {
+      let { email, code, newPassword } = req.body || {};
+
+      if (!email || !code || !newPassword) {
+        return res.status(400).json({ error: 'missing_fields' });
+      }
+
+      if (String(newPassword).length < 6) {
+        return res.status(400).json({ error: 'password_too_short' });
+      }
+
+      email = String(email).trim().toLowerCase();
+
+      const userResult = await db.query(
+        `SELECT id FROM users WHERE email=$1`,
+        [email]
+      );
+
+      if (!userResult.rows.length) {
+        return res.status(400).json({ error: 'invalid_or_expired_code' });
+      }
+
+      const userId = userResult.rows[0].id;
+
+      const codeResult = await db.query(
+        `
+        SELECT code, expires_at
+        FROM password_reset_codes
+        WHERE user_id=$1
+        `,
+        [userId]
+      );
+
+      if (
+        !codeResult.rows.length ||
+        codeResult.rows[0].code !== String(code) ||
+        new Date(codeResult.rows[0].expires_at) < new Date()
+      ) {
+        return res.status(400).json({ error: 'invalid_or_expired_code' });
+      }
+
+      await db.query(
+        `UPDATE users SET password_hash=$1 WHERE id=$2`,
+        [hashPassword(newPassword), userId]
+      );
+
+      await db.query(
+        `DELETE FROM password_reset_codes WHERE user_id=$1`,
+        [userId]
+      );
+
+      res.json({ ok: true });
+
+    } catch (e) {
+      console.error('reset-password error:', e.message);
+      res.status(500).json({ error: 'server_error' });
     }
   }
 );
@@ -5259,6 +5437,65 @@ app.post('/api/admin/tournament/payout', adminOnly, async (req, res) => {
    RESERVE PAID ENTRY
 ========================================================= */
 
+/* =========================================================
+   CREATE FREE MATCH RECORD
+   Same purpose as reservePaidEntries, but for stake=0 matches:
+   no balance to lock (nothing to reserve), so this just inserts
+   the paid_matches row directly. Without this row, a free match
+   has no matchId, and report_result falls back to only bumping
+   the player's own win/loss counters — which is why real-vs-real
+   free wins were invisible to History and the tournament
+   leaderboard (both read exclusively from paid_matches), even
+   though wins-vs-bots were already being recorded correctly via
+   their own separate insert.
+========================================================= */
+
+async function createFreeMatchRecord(
+  roomId,
+  p1UserId,
+  p2UserId
+) {
+  const result =
+    await db.query(
+      `
+      INSERT INTO
+        paid_matches
+      (
+        room_id,
+        p1_user_id,
+        p2_user_id,
+        stake,
+        prize,
+        status
+      )
+
+      VALUES
+      (
+        $1,
+        $2,
+        $3,
+        0,
+        0,
+        'active'
+      )
+
+      RETURNING
+        id,
+        room_id,
+        stake,
+        prize,
+        status
+      `,
+      [
+        roomId,
+        p1UserId,
+        p2UserId
+      ]
+    );
+
+  return result.rows[0];
+}
+
 async function reservePaidEntries(
   roomId,
   p1UserId,
@@ -7341,7 +7578,14 @@ io.on(
             // transaction — there's nothing to reserve, and running it
             // anyway only adds a DB round-trip that can fail (e.g. a
             // players_not_found edge case) and wrongly bounce two players
-            // who were correctly matched right back to the lobby.
+            // who were correctly matched right back to the lobby. They
+            // still get a lightweight paid_matches row (stake=0) so the
+            // match has a real record — otherwise a real-vs-real free win
+            // never shows up in History or the weekly tournament
+            // leaderboard, even though a win vs a bot does (that path
+            // inserts its own row separately). A failure here is non-fatal:
+            // the match still starts, it just won't be tracked for the
+            // tournament (matches the pre-fix behavior, not a regression).
             if (!isFree) {
               try {
                 paidMatch =
@@ -7379,6 +7623,22 @@ io.on(
                 );
 
                 return;
+              }
+            } else {
+              try {
+                paidMatch =
+                  await createFreeMatchRecord(
+                    roomId,
+                    effectiveWaiting.userId,
+                    userId
+                  );
+              } catch (e) {
+                console.error(
+                  '[find_match] createFreeMatchRecord failed, roomId=' + roomId +
+                  ' rawError=' + e.message
+                );
+                // Non-fatal — the free match still proceeds untracked,
+                // same as before this fix.
               }
             }
 
@@ -8295,6 +8555,8 @@ async function startServer() {
     await initGlobalChatTable();
 
     await initTelegramJoinTable();
+
+    await initPasswordResetTable();
 
     await initAppConfig();
 
