@@ -4020,6 +4020,38 @@ app.get(
   }
 );
 
+// Bulk-clear the wallet transaction history/log (e.g. after a round of
+// testing). This ONLY deletes rows from wallet_transactions — it never
+// touches users.balance, so any real balance changes that already
+// happened stay exactly as they are. This is a history/audit-trail
+// wipe, not a financial reversal.
+app.post(
+  '/api/admin/wallet/transactions/delete-all',
+  adminOnly,
+  async (_req, res) => {
+    try {
+      const result =
+        await db.query(
+          `DELETE FROM wallet_transactions`
+        );
+
+      res.json({
+        ok: true,
+        deleted: result.rowCount
+      });
+
+    } catch (e) {
+      console.error('wallet transactions delete-all error:', e.message);
+      res
+        .status(500)
+        .json({
+          error:
+            'server_error'
+        });
+    }
+  }
+);
+
 /* =========================================================
    APPROVE DEPOSIT
 ========================================================= */
@@ -5203,6 +5235,19 @@ app.post('/api/admin/tournament/fake/:id/delete', adminOnly, async (req, res) =>
     res.json({ ok: true });
   } catch (e) {
     console.error('fake leaderboard delete error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Bulk-remove every seeded (fake) leaderboard entry in one go, so the
+// operator doesn't have to delete potentially hundreds of rows one at a
+// time. Only ever touches fake_leaderboard — never real users/matches.
+app.post('/api/admin/tournament/fake/delete-all', adminOnly, async (req, res) => {
+  try {
+    const result = await db.query(`DELETE FROM fake_leaderboard`);
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (e) {
+    console.error('fake leaderboard delete-all error:', e.message);
     res.status(500).json({ error: 'server_error' });
   }
 });
