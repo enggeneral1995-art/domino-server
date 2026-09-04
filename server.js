@@ -6950,12 +6950,107 @@ function otherPlayer(
 // they're currently in, crediting the remaining player the win (and, for
 // paid matches, the prize). Safe to call even if the socket isn't
 // currently in any room (does nothing in that case).
-async function handlePlayerLeftRoom(socketId) {
+/* =========================================================
+   RECONNECT GRACE PERIOD
+   A dropped socket no longer forfeits the match instantly. The
+   room is parked for a short window so a player on a flaky
+   mobile connection can rejoin the SAME match instead of losing
+   it (and, in paid matches, losing their stake) to a 5-second
+   signal blip. If they don't come back in time, the original
+   forfeit path runs exactly as before.
+========================================================= */
+
+const RECONNECT_GRACE_MS = 45000;
+
+// roomId -> { timer, room, seatIdx, userId }
+const pendingReconnects = new Map();
+
+function reconnectKey(roomId, userId) {
+  return roomId + '|' + userId;
+}
+
+async function handlePlayerLeftRoom(socketId, opts) {
+  const immediate = !!(opts && opts.immediate);
+
   const roomId = socketRoom.get(socketId);
   if (!roomId || !rooms.has(roomId)) return;
 
   const room = rooms.get(roomId);
   const opponent = otherPlayer(room, socketId);
+
+  const hasTrackedMatch =
+    room.matchId &&
+    room.userIds &&
+    room.userIds[0] &&
+    room.userIds[1];
+
+  // Give a dropped (not deliberately-leaving) player a chance to come back
+  // before we forfeit their match. Only for real tracked matches — an
+  // untracked/free-floating room has nothing worth preserving.
+  if (!immediate && hasTrackedMatch) {
+    const seatIdx = room.players[0] === socketId ? 0 : 1;
+    const userId = room.userIds[seatIdx];
+    const key = reconnectKey(roomId, userId);
+
+    // Already waiting on this player (duplicate disconnect) — ignore.
+    if (pendingReconnects.has(key)) return;
+
+    // Detach the dead socket but KEEP the room alive so the seat can be
+    // reclaimed. socketRoom for the dead id goes away; the room itself and
+    // the opponent's mapping stay untouched.
+    socketRoom.delete(socketId);
+
+    if (opponent) {
+      io.to(opponent).emit('opponent_reconnecting', {
+        match_id: room.matchId,
+        grace_ms: RECONNECT_GRACE_MS
+      });
+    }
+
+    const timer = setTimeout(async () => {
+      pendingReconnects.delete(key);
+      // Still gone after the grace window — run the real forfeit.
+      if (rooms.has(roomId)) {
+        socketRoom.set(socketId, roomId);
+        await finalizePlayerLeftRoom(socketId);
+      }
+    }, RECONNECT_GRACE_MS);
+
+    pendingReconnects.set(key, {
+      timer,
+      roomId,
+      seatIdx,
+      userId,
+      deadSocketId: socketId
+    });
+
+    console.log('[reconnect] parked roomId=' + roomId + ' userId=' + userId +
+      ' seat=' + seatIdx + ' grace=' + RECONNECT_GRACE_MS + 'ms');
+    return;
+  }
+
+  await finalizePlayerLeftRoom(socketId);
+}
+
+async function finalizePlayerLeftRoom(socketId) {
+  const roomId = socketRoom.get(socketId);
+  if (!roomId || !rooms.has(roomId)) return;
+
+  const room = rooms.get(roomId);
+  const opponent = otherPlayer(room, socketId);
+
+  // Cancel any grace timer still parked for this room — the match is
+  // ending now regardless.
+  if (room.userIds) {
+    for (const uid of room.userIds) {
+      const k = reconnectKey(roomId, uid);
+      const pending = pendingReconnects.get(k);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingReconnects.delete(k);
+      }
+    }
+  }
 
   room.players.forEach(id => { socketRoom.delete(id); });
   rooms.delete(roomId);
@@ -8405,7 +8500,79 @@ io.on(
     socket.on(
       'leave_match',
       async () => {
-        await handlePlayerLeftRoom(socket.id);
+        // Deliberate exit — no grace period, forfeit immediately.
+        await handlePlayerLeftRoom(socket.id, { immediate: true });
+      }
+    );
+
+    // Reclaim a seat in a match this user was dropped from, if we're still
+    // inside the grace window. This is what actually saves a match from a
+    // brief mobile signal drop: the client reconnects with a NEW socket id,
+    // and this swaps that new id into the parked room in place of the dead
+    // one, so play continues instead of the player being forfeited.
+    socket.on(
+      'resume_match',
+      (payload) => {
+        try {
+          const tokenPayload = verifyMatchToken(payload && payload.token);
+          if (!tokenPayload || !tokenPayload.id) {
+            socket.emit('resume_result', { ok: false, error: 'login_required' });
+            return;
+          }
+
+          const userId = tokenPayload.id;
+
+          // Find a parked room belonging to this user.
+          let found = null;
+          for (const [key, pending] of pendingReconnects.entries()) {
+            if (pending.userId === userId) { found = { key, pending }; break; }
+          }
+
+          if (!found) {
+            socket.emit('resume_result', { ok: false, error: 'no_match_to_resume' });
+            return;
+          }
+
+          const key = found.key;
+          const pending = found.pending;
+          const room = rooms.get(pending.roomId);
+
+          if (!room) {
+            clearTimeout(pending.timer);
+            pendingReconnects.delete(key);
+            socket.emit('resume_result', { ok: false, error: 'match_gone' });
+            return;
+          }
+
+          // Stop the forfeit countdown and swap the new socket into the seat.
+          clearTimeout(pending.timer);
+          pendingReconnects.delete(key);
+
+          room.players[pending.seatIdx] = socket.id;
+          socketRoom.set(socket.id, pending.roomId);
+
+          const opponent = otherPlayer(room, socket.id);
+          if (opponent) {
+            io.to(opponent).emit('opponent_resumed', {
+              match_id: room.matchId
+            });
+          }
+
+          console.log('[reconnect] resumed roomId=' + pending.roomId +
+            ' userId=' + userId + ' seat=' + pending.seatIdx +
+            ' newSocket=' + socket.id);
+
+          socket.emit('resume_result', {
+            ok: true,
+            match_id: room.matchId,
+            room_id: pending.roomId,
+            seat: pending.seatIdx
+          });
+
+        } catch (e) {
+          console.error('resume_match error:', e.message);
+          socket.emit('resume_result', { ok: false, error: 'server_error' });
+        }
       }
     );
   }
