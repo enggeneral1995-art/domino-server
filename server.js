@@ -1529,6 +1529,18 @@ async function initAppConfig() {
     ALTER TABLE app_config ADD COLUMN IF NOT EXISTS online_baseline INTEGER NOT NULL DEFAULT 1000
   `);
   await db.query(`
+    ALTER TABLE app_config ADD COLUMN IF NOT EXISTS paid_schedule_enabled BOOLEAN NOT NULL DEFAULT false
+  `);
+  await db.query(`
+    ALTER TABLE app_config ADD COLUMN IF NOT EXISTS paid_open_time TEXT NOT NULL DEFAULT '20:00'
+  `);
+  await db.query(`
+    ALTER TABLE app_config ADD COLUMN IF NOT EXISTS paid_close_time TEXT NOT NULL DEFAULT '00:00'
+  `);
+  await db.query(`
+    ALTER TABLE app_config ADD COLUMN IF NOT EXISTS paid_timezone TEXT NOT NULL DEFAULT 'Asia/Baghdad'
+  `);
+  await db.query(`
     INSERT INTO app_config (id, paid_enabled, online_baseline)
     VALUES (1, true, 1000)
     ON CONFLICT (id) DO NOTHING
@@ -1665,10 +1677,69 @@ app.post(
   }
 );
 
+// Returns the current "HH:MM" wall-clock time in the given IANA timezone,
+// e.g. "Asia/Baghdad" -- used to check the paid-games schedule window
+// against local time for the admin, not server (UTC) time.
+function currentTimeInZone(timezone) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-GB', {
+      timeZone: timezone || 'Asia/Baghdad',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+    return fmt.format(new Date()); // "HH:MM"
+  } catch (e) {
+    // Bad/unknown timezone string -- fall back to UTC rather than crash.
+    const fmt = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false
+    });
+    return fmt.format(new Date());
+  }
+}
+
+// Is "now" (HH:MM) inside the [open, close) window? Handles windows that
+// cross midnight (e.g. open=20:00, close=00:00 or close=02:00) the same
+// way a same-day window (open=09:00, close=17:00) works.
+function isWithinScheduleWindow(nowHHMM, openHHMM, closeHHMM) {
+  if (openHHMM === closeHHMM) return true; // identical open/close = always open
+  const toMinutes = (s) => {
+    const parts = String(s).split(':');
+    const h = parseInt(parts[0], 10) || 0;
+    const m = parseInt(parts[1], 10) || 0;
+    return h * 60 + m;
+  };
+  const now = toMinutes(nowHHMM);
+  const open = toMinutes(openHHMM);
+  const close = toMinutes(closeHHMM);
+  if (open < close) {
+    return now >= open && now < close;
+  }
+  // Crosses midnight (e.g. 20:00 -> 00:00, stored as close="00:00").
+  return now >= open || now < close;
+}
+
 async function isPaidEnabled() {
   try {
-    const result = await db.query(`SELECT paid_enabled FROM app_config WHERE id=1`);
-    return result.rows.length ? !!result.rows[0].paid_enabled : true;
+    const result = await db.query(
+      `SELECT paid_enabled, paid_schedule_enabled, paid_open_time, paid_close_time, paid_timezone
+       FROM app_config WHERE id=1`
+    );
+    if (!result.rows.length) return true;
+    const row = result.rows[0];
+
+    // The manual switch is always a hard "off" -- admin can kill paid
+    // play instantly regardless of what the schedule says. It only ever
+    // gates further when it's true; the schedule (if turned on) then
+    // decides the actual open/closed state minute to minute.
+    if (row.paid_enabled === false) return false;
+
+    if (row.paid_schedule_enabled) {
+      const now = currentTimeInZone(row.paid_timezone);
+      return isWithinScheduleWindow(now, row.paid_open_time, row.paid_close_time);
+    }
+
+    return row.paid_enabled !== false;
   } catch (e) {
     return true;
   }
@@ -1676,14 +1747,25 @@ async function isPaidEnabled() {
 
 app.get('/api/app-config', async (req, res) => {
   try {
-    const cfg = await db.query(`SELECT paid_enabled, online_baseline FROM app_config WHERE id=1`);
+    const cfg = await db.query(
+      `SELECT paid_enabled, online_baseline, paid_schedule_enabled, paid_open_time, paid_close_time, paid_timezone
+       FROM app_config WHERE id=1`
+    );
     const row = cfg.rows[0] || {};
     res.json({
       paid_enabled: row.paid_enabled !== false,
-      online_baseline: row.online_baseline != null ? Number(row.online_baseline) : 1000
+      online_baseline: row.online_baseline != null ? Number(row.online_baseline) : 1000,
+      paid_schedule_enabled: !!row.paid_schedule_enabled,
+      paid_open_time: row.paid_open_time || '20:00',
+      paid_close_time: row.paid_close_time || '00:00',
+      paid_timezone: row.paid_timezone || 'Asia/Baghdad',
+      // What isPaidEnabled() would actually decide right now, computed the
+      // same way, so the admin panel can show "open now" / "closed now"
+      // without duplicating the schedule-window math client-side.
+      paid_live_now: await isPaidEnabled()
     });
   } catch (e) {
-    res.json({ paid_enabled: true, online_baseline: 1000 });
+    res.json({ paid_enabled: true, online_baseline: 1000, paid_schedule_enabled: false, paid_open_time: '20:00', paid_close_time: '00:00', paid_timezone: 'Asia/Baghdad', paid_live_now: true });
   }
 });
 
@@ -1702,24 +1784,56 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
   try {
     const paidEnabled = req.body?.paid_enabled;
     const onlineBaseline = req.body?.online_baseline;
+    const scheduleEnabled = req.body?.paid_schedule_enabled;
+    const openTime = req.body?.paid_open_time;
+    const closeTime = req.body?.paid_close_time;
+    const timezone = req.body?.paid_timezone;
 
     const hasPaid = typeof paidEnabled === 'boolean';
     const hasBaseline = onlineBaseline !== undefined && onlineBaseline !== null;
+    const hasSchedule = typeof scheduleEnabled === 'boolean';
+    const timeRe = /^([01]\d|2[0-3]):([0-5]\d)$/; // "HH:MM", 24-hour
+    const hasOpenTime = openTime !== undefined && openTime !== null;
+    const hasCloseTime = closeTime !== undefined && closeTime !== null;
+    const hasTimezone = typeof timezone === 'string' && timezone.trim() !== '';
 
-    if (!hasPaid && !hasBaseline) {
+    if (!hasPaid && !hasBaseline && !hasSchedule && !hasOpenTime && !hasCloseTime && !hasTimezone) {
       return res.status(400).json({ error: 'nothing_to_update' });
     }
     if (hasBaseline && (!Number.isInteger(onlineBaseline) || onlineBaseline < 0)) {
       return res.status(400).json({ error: 'invalid_online_baseline' });
+    }
+    if (hasOpenTime && !timeRe.test(openTime)) {
+      return res.status(400).json({ error: 'invalid_open_time' });
+    }
+    if (hasCloseTime && !timeRe.test(closeTime)) {
+      return res.status(400).json({ error: 'invalid_close_time' });
+    }
+    if (hasTimezone) {
+      // Reject an unrecognized IANA zone name up front, instead of only
+      // finding out later inside isPaidEnabled()'s try/catch.
+      try { new Intl.DateTimeFormat('en-GB', { timeZone: timezone }); }
+      catch (e) { return res.status(400).json({ error: 'invalid_timezone' }); }
     }
 
     await db.query(`
       UPDATE app_config
       SET paid_enabled=COALESCE($1, paid_enabled),
           online_baseline=COALESCE($2, online_baseline),
+          paid_schedule_enabled=COALESCE($3, paid_schedule_enabled),
+          paid_open_time=COALESCE($4, paid_open_time),
+          paid_close_time=COALESCE($5, paid_close_time),
+          paid_timezone=COALESCE($6, paid_timezone),
           updated_at=NOW()
       WHERE id=1
-    `, [hasPaid ? paidEnabled : null, hasBaseline ? onlineBaseline : null]);
+    `, [
+      hasPaid ? paidEnabled : null,
+      hasBaseline ? onlineBaseline : null,
+      hasSchedule ? scheduleEnabled : null,
+      hasOpenTime ? openTime : null,
+      hasCloseTime ? closeTime : null,
+      hasTimezone ? timezone : null
+    ]);
 
     res.json({ ok: true });
   } catch (e) {
