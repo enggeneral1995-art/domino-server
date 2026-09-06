@@ -1892,7 +1892,7 @@ const MIN_WITHDRAW =
   Number(
     process.env
       .USDT_MIN_WITHDRAW ||
-    10
+    15
   );
 
 const MAX_WITHDRAW =
