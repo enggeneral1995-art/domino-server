@@ -5044,6 +5044,39 @@ async function initFakeLeaderboard() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await db.query(`
+    ALTER TABLE fake_leaderboard
+      ADD COLUMN IF NOT EXISTS last_auto_increment_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS increment_interval_seconds INTEGER NOT NULL DEFAULT 420
+  `);
+}
+
+// How often (in seconds) a single fake entry waits before its win count
+// ticks up again. Randomized per entry and re-randomized after every tick
+// so different rows drift in and out of sync with each other (one every
+// ~7 minutes, another every ~8, etc.) rather than all moving in lockstep.
+function randomIncrementIntervalSeconds() {
+  return 300 + Math.floor(Math.random() * 300); // 5–10 minutes
+}
+
+// Ticks any fake leaderboard entries that are "due" for their next
+// automatic win bump, so the leaderboard looks like real people are
+// playing throughout the day instead of sitting frozen between manual
+// admin edits. Purely cosmetic -- see the big comment above
+// initFakeLeaderboard(): these rows are never read by the real payout
+// logic, so this can never cost real money.
+async function tickFakeLeaderboard() {
+  try {
+    await db.query(`
+      UPDATE fake_leaderboard
+      SET wins = wins + (CASE WHEN random() < 0.15 THEN 2 ELSE 1 END),
+          last_auto_increment_at = NOW(),
+          increment_interval_seconds = 300 + floor(random() * 300)::int
+      WHERE NOW() - last_auto_increment_at >= (increment_interval_seconds || ' seconds')::interval
+    `);
+  } catch (e) {
+    console.error('fake leaderboard auto-increment error:', e.message);
+  }
 }
 
 // Automatic weekly reshuffling of the seeded (fake) entries' win counts
@@ -5327,10 +5360,10 @@ app.post('/api/admin/tournament/fake', adminOnly, async (req, res) => {
     if (!name) return res.status(400).json({ error: 'display_name_required' });
     if (!Number.isInteger(wins) || wins < 0) return res.status(400).json({ error: 'invalid_wins' });
     const result = await db.query(`
-      INSERT INTO fake_leaderboard (display_name, wins)
-      VALUES ($1, $2)
+      INSERT INTO fake_leaderboard (display_name, wins, last_auto_increment_at, increment_interval_seconds)
+      VALUES ($1, $2, NOW(), $3)
       RETURNING id, display_name, wins
-    `, [name, wins]);
+    `, [name, wins, randomIncrementIntervalSeconds()]);
     res.json({ ok: true, entry: result.rows[0] });
   } catch (e) {
     console.error('fake leaderboard add error:', e.message);
@@ -5424,7 +5457,7 @@ app.post('/api/admin/tournament/fake/generate', adminOnly, async (req, res) => {
     try {
       await client.query('BEGIN');
       for (const r of rows) {
-        await client.query(`INSERT INTO fake_leaderboard (display_name, wins) VALUES ($1,$2)`, [r.name, r.wins]);
+        await client.query(`INSERT INTO fake_leaderboard (display_name, wins, last_auto_increment_at, increment_interval_seconds) VALUES ($1,$2,NOW(),$3)`, [r.name, r.wins, randomIncrementIntervalSeconds()]);
       }
       await client.query('COMMIT');
     } catch (e) {
@@ -8890,6 +8923,8 @@ async function startServer() {
     await initTournamentTables();
 
     await initFakeLeaderboard();
+
+    setInterval(tickFakeLeaderboard, 60 * 1000);
 
     // One-time cleanup: clear any stale fake_reset_period marker so the
     // next tournament view definitely triggers a fresh atomic reset.
