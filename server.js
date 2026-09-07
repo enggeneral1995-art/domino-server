@@ -5047,7 +5047,8 @@ async function initFakeLeaderboard() {
   await db.query(`
     ALTER TABLE fake_leaderboard
       ADD COLUMN IF NOT EXISTS last_auto_increment_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      ADD COLUMN IF NOT EXISTS increment_interval_seconds INTEGER NOT NULL DEFAULT 420
+      ADD COLUMN IF NOT EXISTS increment_interval_seconds INTEGER NOT NULL DEFAULT 420,
+      ADD COLUMN IF NOT EXISTS auto_increment_enabled BOOLEAN NOT NULL DEFAULT true
   `);
 }
 
@@ -5072,7 +5073,8 @@ async function tickFakeLeaderboard() {
       SET wins = wins + (CASE WHEN random() < 0.15 THEN 2 ELSE 1 END),
           last_auto_increment_at = NOW(),
           increment_interval_seconds = 300 + floor(random() * 300)::int
-      WHERE NOW() - last_auto_increment_at >= (increment_interval_seconds || ' seconds')::interval
+      WHERE auto_increment_enabled
+        AND NOW() - last_auto_increment_at >= (increment_interval_seconds || ' seconds')::interval
     `);
   } catch (e) {
     console.error('fake leaderboard auto-increment error:', e.message);
@@ -5088,13 +5090,14 @@ async function tickFakeLeaderboard() {
 
 async function getFakeLeaderboardEntries() {
   const result = await db.query(`
-    SELECT id, display_name, wins FROM fake_leaderboard ORDER BY wins DESC, id ASC
+    SELECT id, display_name, wins, auto_increment_enabled FROM fake_leaderboard ORDER BY wins DESC, id ASC
   `);
   return result.rows.map(r => ({
     id: r.id,
     fake: true,
     display_name: r.display_name,
-    wins: Number(r.wins)
+    wins: Number(r.wins),
+    auto_increment_enabled: r.auto_increment_enabled !== false
   }));
 }
 
@@ -5384,6 +5387,30 @@ app.post('/api/admin/tournament/fake/:id', adminOnly, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error('fake leaderboard update error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/tournament/fake/:id/toggle-auto', adminOnly, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const enabled = req.body?.enabled;
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled_boolean_required' });
+    }
+    // Resuming resets the clock so it doesn't immediately fire a tick
+    // it "owed" from while paused -- same fresh randomized wait as a
+    // brand-new entry gets.
+    await db.query(`
+      UPDATE fake_leaderboard
+      SET auto_increment_enabled=$1,
+          last_auto_increment_at=CASE WHEN $1 THEN NOW() ELSE last_auto_increment_at END,
+          increment_interval_seconds=CASE WHEN $1 THEN $2 ELSE increment_interval_seconds END
+      WHERE id=$3
+    `, [enabled, randomIncrementIntervalSeconds(), id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('fake leaderboard toggle-auto error:', e.message);
     res.status(500).json({ error: 'server_error' });
   }
 });
