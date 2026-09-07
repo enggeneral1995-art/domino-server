@@ -5035,6 +5035,31 @@ async function getLeaderboardForPeriod(periodStr, limit) {
    money — they only appear in the leaderboard people SEE.
 ========================================================= */
 
+async function initClientErrorsTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS client_errors (
+      id BIGSERIAL PRIMARY KEY,
+      message TEXT,
+      source TEXT,
+      line INTEGER,
+      col INTEGER,
+      stack TEXT,
+      user_id INTEGER,
+      user_agent TEXT,
+      url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  // Errors happen in bursts (one bad frame can log the same message dozens
+  // of times) -- keep only the last 2000 rows so this can never grow into
+  // a real storage/performance problem left unattended.
+  await db.query(`
+    DELETE FROM client_errors WHERE id NOT IN (
+      SELECT id FROM client_errors ORDER BY id DESC LIMIT 2000
+    )
+  `);
+}
+
 async function initFakeLeaderboard() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS fake_leaderboard (
@@ -5352,6 +5377,98 @@ app.post('/api/admin/tournament/tiers/:id/delete', adminOnly, async (req, res) =
     res.json({ ok: true });
   } catch (e) {
     console.error('tournament tier delete error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Lightweight per-IP rate limit for /api/client-error -- just enough to
+// stop one runaway client from flooding the table, no external library.
+const clientErrorRateLimit = new Map(); // ip -> { count, windowStart }
+function isClientErrorRateLimited(ip) {
+  const now = Date.now();
+  const windowMs = 5 * 60 * 1000;
+  const maxPerWindow = 20;
+  const entry = clientErrorRateLimit.get(ip);
+  if (!entry || now - entry.windowStart > windowMs) {
+    clientErrorRateLimit.set(ip, { count: 1, windowStart: now });
+    return false;
+  }
+  entry.count++;
+  return entry.count > maxPerWindow;
+}
+
+// Silent client-side error reporting -- no UI, nothing shown to the
+// player. Lets us see real crashes happening for real users (via Railway
+// logs or the admin panel) without ever putting a debug overlay in front
+// of live traffic. Public (no auth) since errors can happen before login,
+// but rate-limited per IP and caps every field's length so it can never
+// become an abuse/storage vector.
+app.post('/api/client-error', async (req, res) => {
+  try {
+    const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    if (isClientErrorRateLimited(ip)) {
+      return res.status(429).json({ ok: false });
+    }
+
+    let userId = null;
+    const header = req.headers.authorization || '';
+    if (header.startsWith('Bearer ')) {
+      try {
+        const payload = jwt.verify(header.slice(7), JWT_SECRET);
+        userId = payload && payload.id ? Number(payload.id) : null;
+      } catch (e) { /* not logged in / bad token -- fine, report anonymously */ }
+    }
+
+    const message = String(req.body?.message || '').slice(0, 500);
+    const source = String(req.body?.source || '').slice(0, 300);
+    const line = Number.isInteger(req.body?.line) ? req.body.line : null;
+    const col = Number.isInteger(req.body?.col) ? req.body.col : null;
+    const stack = String(req.body?.stack || '').slice(0, 2000);
+    const userAgent = String(req.headers['user-agent'] || '').slice(0, 300);
+    const url = String(req.body?.url || '').slice(0, 300);
+
+    if (!message) return res.status(400).json({ ok: false });
+
+    console.error('[CLIENT ERROR] ' + message + ' @ ' + source + ':' + line + ':' + col + (userId ? ' userId=' + userId : ''));
+
+    await db.query(`
+      INSERT INTO client_errors (message, source, line, col, stack, user_id, user_agent, url)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `, [message, source, line, col, stack, userId, userAgent, url]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    // Never let error-reporting itself become a source of errors the
+    // player can see -- always respond ok-ish and move on.
+    res.status(200).json({ ok: false });
+  }
+});
+
+app.get('/api/admin/client-errors', adminOnly, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT message, source, line, col, COUNT(*)::int AS occurrences,
+             MAX(created_at) AS last_seen, MIN(created_at) AS first_seen,
+             COUNT(DISTINCT user_id)::int AS affected_users
+      FROM client_errors
+      WHERE created_at > NOW() - INTERVAL '7 days'
+      GROUP BY message, source, line, col
+      ORDER BY MAX(created_at) DESC
+      LIMIT 100
+    `);
+    res.json({ errors: result.rows });
+  } catch (e) {
+    console.error('admin client-errors list error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/client-errors/clear', adminOnly, async (req, res) => {
+  try {
+    await db.query(`DELETE FROM client_errors`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('admin client-errors clear error:', e.message);
     res.status(500).json({ error: 'server_error' });
   }
 });
@@ -8950,6 +9067,8 @@ async function startServer() {
     await initTournamentTables();
 
     await initFakeLeaderboard();
+
+    await initClientErrorsTable();
 
     setInterval(tickFakeLeaderboard, 60 * 1000);
 
