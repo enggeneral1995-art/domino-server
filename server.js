@@ -8883,13 +8883,14 @@ io.on(
 
     socket.on(
       'game_move',
-      message => {
+      (message, ack) => {
         const roomId =
           socketRoom.get(
             socket.id
           );
 
         if (!roomId) {
+          if (typeof ack === 'function') ack({ ok: false });
           return;
         }
 
@@ -8899,8 +8900,21 @@ io.on(
           );
 
         if (!room) {
+          if (typeof ack === 'function') ack({ ok: false });
           return;
         }
+
+        // A retried move (lost ack, client resends with the same nonce)
+        // must never be processed twice -- that would double-count it in
+        // room.moves/room.log and relay a duplicate placement to the
+        // opponent. Just re-confirm receipt without redoing any of it.
+        const nonce = message && message.nonce;
+        if (!room.lastMoveNonceBySocket) room.lastMoveNonceBySocket = {};
+        if (nonce && room.lastMoveNonceBySocket[socket.id] === nonce) {
+          if (typeof ack === 'function') ack({ ok: true });
+          return;
+        }
+        if (nonce) room.lastMoveNonceBySocket[socket.id] = nonce;
 
         room.moves++;
 
@@ -8925,6 +8939,7 @@ io.on(
           );
 
         if (!opponent) {
+          if (typeof ack === 'function') ack({ ok: true });
           return;
         }
 
@@ -8934,6 +8949,8 @@ io.on(
           'game_move',
           message
         );
+
+        if (typeof ack === 'function') ack({ ok: true });
       }
     );
 
