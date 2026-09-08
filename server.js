@@ -864,18 +864,6 @@ async function updateUserLocation(userId, req) {
   }
 }
 
-async function initAdminMessagesTable() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS admin_messages (
-      id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      message TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      read_at TIMESTAMPTZ
-    )
-  `);
-}
-
 async function initAdminUserTools() {
   await db.query(`
     ALTER TABLE users
@@ -1646,6 +1634,15 @@ async function initAdminMessagesTable() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  // Safety net: earlier deploys briefly created this table with different
+  // column names (message/read_at, delivered instead of read). If a live
+  // table from one of those is still around, this guarantees the columns
+  // the current code actually queries exist, without dropping anything.
+  await db.query(`
+    ALTER TABLE admin_messages
+      ADD COLUMN IF NOT EXISTS text TEXT,
+      ADD COLUMN IF NOT EXISTS read BOOLEAN NOT NULL DEFAULT false
+  `);
 }
 
 async function initGlobalChatTable() {
@@ -1667,34 +1664,6 @@ async function initGlobalChatTable() {
     ON global_chat_messages(created_at DESC)
   `);
 }
-
-// Public — no auth required, so the chat panel can show recent history
-// even before/while the person is signing in. Only sending a message
-// requires being logged in (checked in the socket handler).
-app.get('/api/my-messages', auth, async (req, res) => {
-  try {
-    const result = await db.query(`
-      SELECT id, message, created_at
-      FROM admin_messages
-      WHERE user_id = $1 AND delivered_at IS NULL
-      ORDER BY created_at ASC
-    `, [req.user.id]);
-
-    if (result.rows.length) {
-      await db.query(`
-        UPDATE admin_messages SET delivered_at = NOW()
-        WHERE user_id = $1 AND delivered_at IS NULL
-      `, [req.user.id]);
-    }
-
-    res.json({
-      messages: result.rows.map(r => ({ id: r.id, message: r.message, created_at: r.created_at }))
-    });
-  } catch (e) {
-    console.error('my-messages error:', e.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
 
 app.get('/api/global-chat/history', async (req, res) => {
   try {
@@ -1729,18 +1698,6 @@ app.get('/api/global-chat/history', async (req, res) => {
    it's on the honor system — much simpler to set up, at the cost
    of someone being able to claim without actually joining/staying.
 ========================================================= */
-
-async function initAdminMessagesTable() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS admin_messages (
-      id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      text TEXT NOT NULL,
-      delivered BOOLEAN NOT NULL DEFAULT false,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-}
 
 async function initTelegramJoinTable() {
   await db.query(`
@@ -6836,139 +6793,6 @@ app.post('/api/admin/users/:id/ban', adminOnly, async (req, res) => {
   }
 });
 
-app.post('/api/admin/users/:id/message', adminOnly, async (req, res) => {
-  try {
-    const userId = Number(req.params.id);
-    const message = String(req.body?.message || '').trim().slice(0, 1000);
-    if (!Number.isInteger(userId)) {
-      return res.status(400).json({ error: 'valid_user_id_required' });
-    }
-    if (!message) {
-      return res.status(400).json({ error: 'message_required' });
-    }
-
-    const userCheck = await db.query(`SELECT id FROM users WHERE id=$1`, [userId]);
-    if (!userCheck.rows.length) {
-      return res.status(404).json({ error: 'user_not_found' });
-    }
-
-    // Deliver live to any socket(s) this user currently has open (the same
-    // userId -> socketId tracking the ban feature uses), and mark it
-    // delivered right away. If they're offline, it's just left undelivered
-    // and picked up next time their client checks in via GET /api/my-messages.
-    const socketIds = userSockets.get(userId);
-    let delivered = false;
-    if (socketIds && socketIds.size) {
-      for (const socketId of socketIds) {
-        try {
-          const sock = io.sockets.sockets.get(socketId);
-          if (sock) {
-            sock.emit('admin_message', { message, created_at: new Date().toISOString() });
-            delivered = true;
-          }
-        } catch (e) {}
-      }
-    }
-
-    await db.query(`
-      INSERT INTO admin_messages (user_id, message, delivered_at)
-      VALUES ($1, $2, $3)
-    `, [userId, message, delivered ? new Date() : null]);
-
-    res.json({ ok: true, delivered_live: delivered });
-  } catch (e) {
-    console.error('admin message error:', e.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-app.post('/api/admin/users/:id/message', adminOnly, async (req, res) => {
-  try {
-    const userId = Number(req.params.id);
-    const text = String(req.body?.text || '').trim().slice(0, 1000);
-    if (!Number.isInteger(userId)) {
-      return res.status(400).json({ error: 'valid_user_id_required' });
-    }
-    if (!text) {
-      return res.status(400).json({ error: 'text_required' });
-    }
-
-    const userCheck = await db.query(`SELECT id FROM users WHERE id=$1`, [userId]);
-    if (!userCheck.rows.length) {
-      return res.status(404).json({ error: 'user_not_found' });
-    }
-
-    // Insert first so we have a real id to hand to the live push below --
-    // the client marks a message read by id (POST /api/admin-messages/:id/read).
-    const inserted = await db.query(`
-      INSERT INTO admin_messages (user_id, text, delivered)
-      VALUES ($1, $2, false)
-      RETURNING id, created_at
-    `, [userId, text]);
-    const messageRow = inserted.rows[0];
-
-    // Try live delivery too (any socket this user currently has open) --
-    // if they're online they see it immediately instead of waiting for
-    // their next connect. Still left delivered=false in the DB either
-    // way; the client itself calls the /read endpoint once it's actually
-    // shown the message, which is the real signal it was seen.
-    const ids = userSockets.get(userId);
-    let deliveredLive = false;
-    if (ids && ids.size) {
-      for (const socketId of ids) {
-        const sock = io.sockets.sockets.get(socketId);
-        if (sock) {
-          sock.emit('admin_message', { id: messageRow.id, text, created_at: messageRow.created_at });
-          deliveredLive = true;
-        }
-      }
-    }
-
-    res.json({ ok: true, delivered_live: deliveredLive });
-  } catch (e) {
-    console.error('admin send message error:', e.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// The player's own client calls this on every connect/reconnect to pick
-// up any admin message that arrived while they were offline (the frontend
-// already expects exactly this path/shape).
-app.get('/api/admin-messages/unread', auth, async (req, res) => {
-  try {
-    const result = await db.query(`
-      SELECT id, text, created_at FROM admin_messages
-      WHERE user_id=$1 AND delivered=false
-      ORDER BY created_at ASC
-    `, [req.user.id]);
-
-    res.json({ messages: result.rows });
-  } catch (e) {
-    console.error('admin-messages/unread error:', e.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
-// Client calls this right after showing a given message (live push or
-// from the unread list above) so it isn't shown again next time.
-// Scoped to the caller's own id -- you can only mark your own messages.
-app.post('/api/admin-messages/:id/read', auth, async (req, res) => {
-  try {
-    const messageId = Number(req.params.id);
-    if (!Number.isInteger(messageId)) {
-      return res.status(400).json({ error: 'valid_message_id_required' });
-    }
-    await db.query(`
-      UPDATE admin_messages SET delivered=true
-      WHERE id=$1 AND user_id=$2
-    `, [messageId, req.user.id]);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('admin-messages/read error:', e.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
-
 app.post('/api/admin/users/:id/chat-mod', adminOnly, async (req, res) => {
   try {
     const userId = Number(req.params.id);
@@ -7020,6 +6844,7 @@ app.post('/api/admin/users/:id/message', adminOnly, async (req, res) => {
     // Deliver immediately if they're online right now; either way it's
     // saved, so it's waiting for them next time they open the app even
     // if this doesn't reach a live socket.
+    let deliveredLive = false;
     try {
       const ids = userSockets.get(userId);
       if (ids) {
@@ -7031,12 +6856,13 @@ app.post('/api/admin/users/:id/message', adminOnly, async (req, res) => {
               text: message.text,
               ts: new Date(message.created_at).getTime()
             });
+            deliveredLive = true;
           }
         }
       }
     } catch (e) {}
 
-    res.json({ ok: true, message });
+    res.json({ ok: true, message, delivered_live: deliveredLive });
   } catch (e) {
     console.error('admin message error:', e.message);
     res.status(500).json({ error: 'server_error' });
@@ -9633,10 +9459,6 @@ async function startServer() {
     await initVisitTables();
 
     await initGlobalChatTable();
-
-    await initAdminMessagesTable();
-
-    await initAdminMessagesTable();
 
     await initTelegramJoinTable();
 
