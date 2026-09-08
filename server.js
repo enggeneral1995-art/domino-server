@@ -5060,6 +5060,35 @@ async function initClientErrorsTable() {
   `);
 }
 
+// Safety net for paid matches that never got settled -- if a match's
+// in-memory room is gone (both sockets disconnected for good, or a
+// client-side crash nobody could recover from) but its DB row is still
+// sitting "active" a long time later, nothing will ever resolve it on its
+// own. Rather than leaving both players' stakes locked indefinitely until
+// an admin happens to notice and click Refund, automatically refund it.
+// Checking rooms.has() (not just elapsed time) means a real, unusually
+// long game in progress is never touched -- it always still has a live
+// room -- this only catches matches that are truly orphaned.
+async function autoRefundOrphanedPaidMatches() {
+  try {
+    const result = await db.query(`
+      SELECT id, room_id FROM paid_matches
+      WHERE status = 'active'
+        AND updated_at < NOW() - INTERVAL '30 minutes'
+    `);
+    for (const row of result.rows) {
+      if (!rooms.has(row.room_id)) {
+        const refunded = await refundPaidMatch(row.id);
+        if (refunded) {
+          console.log('[auto-refund] refunded orphaned paid match id=' + row.id + ' room=' + row.room_id);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('auto-refund orphaned matches error:', e.message);
+  }
+}
+
 async function initFakeLeaderboard() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS fake_leaderboard (
@@ -6581,12 +6610,19 @@ app.get(
       const result =
         await db.query(
           `
-          SELECT *
+          SELECT
+            pm.*,
+            u1.username AS p1_username,
+            u2.username AS p2_username,
+            uw.username AS winner_username
 
-          FROM paid_matches
+          FROM paid_matches pm
+          LEFT JOIN users u1 ON u1.id = pm.p1_user_id
+          LEFT JOIN users u2 ON u2.id = pm.p2_user_id
+          LEFT JOIN users uw ON uw.id = pm.winner_user_id
 
           ORDER BY
-            created_at DESC
+            pm.created_at DESC
 
           LIMIT 200
           `
@@ -8206,7 +8242,7 @@ io.on(
 
     socket.on(
       'draw_tile',
-      () => {
+      (payload) => {
         const roomId =
           socketRoom.get(
             socket.id
@@ -8235,6 +8271,17 @@ io.on(
             ? 0
             : 1;
 
+        // A retried request (lost response, client resends with the same
+        // nonce) must never draw a second tile -- replay whatever we
+        // already told this seat last time instead.
+        const nonce = payload && payload.nonce;
+        if (!room.lastDrawByseat) room.lastDrawByseat = {};
+        const cached = room.lastDrawByseat[seat];
+        if (nonce && cached && cached.nonce === nonce) {
+          socket.emit('draw_tile_result', cached.result);
+          return;
+        }
+
         const opponent =
           otherPlayer(
             room,
@@ -8245,18 +8292,15 @@ io.on(
           room.boneyard
             .length === 0
         ) {
+          const result = {
+            ok: false,
+            empty: true,
+            boneyard_left: 0
+          };
+          if (nonce) room.lastDrawByseat[seat] = { nonce, result };
           socket.emit(
             'draw_tile_result',
-            {
-              ok:
-                false,
-
-              empty:
-                true,
-
-              boneyard_left:
-                0
-            }
+            result
           );
 
           return;
@@ -8281,19 +8325,16 @@ io.on(
           });
         }
 
+        const result = {
+          ok: true,
+          value,
+          boneyard_left: room.boneyard.length
+        };
+        if (nonce) room.lastDrawByseat[seat] = { nonce, result };
+
         socket.emit(
           'draw_tile_result',
-          {
-            ok:
-              true,
-
-            value,
-
-            boneyard_left:
-              room
-                .boneyard
-                .length
-          }
+          result
         );
 
         if (opponent) {
@@ -9071,6 +9112,8 @@ async function startServer() {
     await initClientErrorsTable();
 
     setInterval(tickFakeLeaderboard, 60 * 1000);
+
+    setInterval(autoRefundOrphanedPaidMatches, 5 * 60 * 1000);
 
     // One-time cleanup: clear any stale fake_reset_period marker so the
     // next tournament view definitely triggers a fresh atomic reset.
