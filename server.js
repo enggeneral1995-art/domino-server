@@ -725,7 +725,10 @@ function publicUser(user) {
 
     photo_url:
       user.photo_url ||
-      null
+      null,
+
+    is_chat_moderator:
+      !!user.is_chat_moderator
   };
 }
 
@@ -861,6 +864,18 @@ async function updateUserLocation(userId, req) {
   }
 }
 
+async function initAdminMessagesTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS admin_messages (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      read_at TIMESTAMPTZ
+    )
+  `);
+}
+
 async function initAdminUserTools() {
   await db.query(`
     ALTER TABLE users
@@ -871,7 +886,8 @@ async function initAdminUserTools() {
       ADD COLUMN IF NOT EXISTS photo_url TEXT,
       ADD COLUMN IF NOT EXISTS banned BOOLEAN NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS ban_reason TEXT,
-      ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ
+      ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS is_chat_moderator BOOLEAN NOT NULL DEFAULT false
   `);
 
   await db.query(`
@@ -1215,6 +1231,50 @@ app.get(
     }
   }
 );
+
+/* =========================================================
+   ADMIN -> PLAYER DIRECT MESSAGES
+========================================================= */
+
+app.get('/api/admin-messages/unread', auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT id, text, created_at
+      FROM admin_messages
+      WHERE user_id=$1 AND read=false
+      ORDER BY created_at ASC
+    `, [req.user.id]);
+
+    res.json({
+      messages: result.rows.map(row => ({
+        id: row.id,
+        text: row.text,
+        ts: new Date(row.created_at).getTime()
+      }))
+    });
+  } catch (e) {
+    console.error('admin-messages/unread error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin-messages/:id/read', auth, async (req, res) => {
+  try {
+    const messageId = Number(req.params.id);
+    if (!Number.isInteger(messageId)) {
+      return res.status(400).json({ error: 'valid_id_required' });
+    }
+    // Scoped to the caller's own user_id so nobody can mark someone
+    // else's message as read.
+    await db.query(`
+      UPDATE admin_messages SET read=true WHERE id=$1 AND user_id=$2
+    `, [messageId, req.user.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('admin-messages/read error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
 
 /* =========================================================
    PROFILE
@@ -1576,6 +1636,18 @@ async function initAppConfig() {
    messages sent after they connect.
 ========================================================= */
 
+async function initAdminMessagesTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS admin_messages (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      read BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
 async function initGlobalChatTable() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS global_chat_messages (
@@ -1587,6 +1659,10 @@ async function initGlobalChatTable() {
     )
   `);
   await db.query(`
+    ALTER TABLE global_chat_messages
+      ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false
+  `);
+  await db.query(`
     CREATE INDEX IF NOT EXISTS global_chat_messages_created_idx
     ON global_chat_messages(created_at DESC)
   `);
@@ -1595,18 +1671,45 @@ async function initGlobalChatTable() {
 // Public — no auth required, so the chat panel can show recent history
 // even before/while the person is signing in. Only sending a message
 // requires being logged in (checked in the socket handler).
+app.get('/api/my-messages', auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT id, message, created_at
+      FROM admin_messages
+      WHERE user_id = $1 AND delivered_at IS NULL
+      ORDER BY created_at ASC
+    `, [req.user.id]);
+
+    if (result.rows.length) {
+      await db.query(`
+        UPDATE admin_messages SET delivered_at = NOW()
+        WHERE user_id = $1 AND delivered_at IS NULL
+      `, [req.user.id]);
+    }
+
+    res.json({
+      messages: result.rows.map(r => ({ id: r.id, message: r.message, created_at: r.created_at }))
+    });
+  } catch (e) {
+    console.error('my-messages error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 app.get('/api/global-chat/history', async (req, res) => {
   try {
     const result = await db.query(`
-      SELECT user_id, name, text, created_at
+      SELECT id, user_id, name, text, created_at
       FROM global_chat_messages
       WHERE created_at > NOW() - INTERVAL '12 hours'
+        AND deleted = false
       ORDER BY created_at ASC
       LIMIT 200
     `);
 
     res.json({
       messages: result.rows.map(row => ({
+        id: row.id,
         userId: row.user_id,
         name: row.name,
         text: row.text,
@@ -1626,6 +1729,18 @@ app.get('/api/global-chat/history', async (req, res) => {
    it's on the honor system — much simpler to set up, at the cost
    of someone being able to claim without actually joining/staying.
 ========================================================= */
+
+async function initAdminMessagesTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS admin_messages (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      delivered BOOLEAN NOT NULL DEFAULT false,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
 
 async function initTelegramJoinTable() {
   await db.query(`
@@ -4963,70 +5078,83 @@ app.get('/api/admin/matches/today', adminOnly, async (req, res) => {
   }
 });
 
+// Computes the same set of match/player stats for a given time boundary
+// (e.g. "since the start of today" or "since 30 days ago") -- shared by
+// the today and last-30-days sections of the analytics endpoint so the
+// two stay consistent instead of drifting apart as separate queries.
+async function computeMatchStatsSince(sinceSql) {
+  const totals = await db.query(`
+    SELECT
+      COUNT(*) AS total_matches,
+      COUNT(*) FILTER (WHERE stake = 0) AS free_matches,
+      COUNT(*) FILTER (WHERE stake > 0) AS paid_matches,
+      COUNT(*) FILTER (WHERE room_id LIKE 'bot-%') AS bot_matches,
+      COUNT(*) FILTER (WHERE room_id NOT LIKE 'bot-%' OR room_id IS NULL) AS real_opponent_matches
+    FROM paid_matches
+    WHERE created_at >= ${sinceSql}
+  `);
+
+  const uniquePlayers = await db.query(`
+    SELECT COUNT(DISTINCT uid) AS n FROM (
+      SELECT p1_user_id AS uid FROM paid_matches WHERE created_at >= ${sinceSql}
+      UNION
+      SELECT p2_user_id AS uid FROM paid_matches WHERE created_at >= ${sinceSql}
+    ) x
+  `);
+
+  const topPaid = await db.query(`
+    SELECT u.id, u.username, COUNT(*)::int AS matches
+    FROM (
+      SELECT p1_user_id AS uid FROM paid_matches WHERE stake > 0 AND created_at >= ${sinceSql}
+      UNION ALL
+      SELECT p2_user_id AS uid FROM paid_matches WHERE stake > 0 AND created_at >= ${sinceSql}
+    ) x
+    JOIN users u ON u.id = x.uid
+    GROUP BY u.id, u.username
+    ORDER BY matches DESC
+    LIMIT 1
+  `);
+
+  const topFree = await db.query(`
+    SELECT u.id, u.username, COUNT(*)::int AS matches
+    FROM (
+      SELECT p1_user_id AS uid FROM paid_matches WHERE stake = 0 AND created_at >= ${sinceSql}
+      UNION ALL
+      SELECT p2_user_id AS uid FROM paid_matches WHERE stake = 0 AND created_at >= ${sinceSql}
+    ) x
+    JOIN users u ON u.id = x.uid
+    GROUP BY u.id, u.username
+    ORDER BY matches DESC
+    LIMIT 1
+  `);
+
+  const row = totals.rows[0] || {};
+  return {
+    total_matches: Number(row.total_matches || 0),
+    free_matches: Number(row.free_matches || 0),
+    paid_matches: Number(row.paid_matches || 0),
+    bot_matches: Number(row.bot_matches || 0),
+    real_opponent_matches: Number(row.real_opponent_matches || 0),
+    unique_players: Number((uniquePlayers.rows[0] || {}).n || 0),
+    top_paid_player: topPaid.rows[0] || null,
+    top_free_player: topFree.rows[0] || null
+  };
+}
+
 app.get('/api/admin/analytics/monthly', adminOnly, async (req, res) => {
   try {
-    // "Last 30 days" rather than the calendar month -- gives a consistent
-    // rolling window regardless of what day of the month it's checked on.
-    const totals = await db.query(`
-      SELECT
-        COUNT(*) AS total_matches,
-        COUNT(*) FILTER (WHERE stake = 0) AS free_matches,
-        COUNT(*) FILTER (WHERE stake > 0) AS paid_matches,
-        COUNT(*) FILTER (WHERE room_id LIKE 'bot-%') AS bot_matches,
-        COUNT(*) FILTER (WHERE room_id NOT LIKE 'bot-%' OR room_id IS NULL) AS real_opponent_matches
-      FROM paid_matches
-      WHERE created_at >= NOW() - INTERVAL '30 days'
-    `);
+    // Both windows share the exact same shape (see computeMatchStatsSince)
+    // so the UI can show "today" as a live-refreshing snapshot right next
+    // to the steadier 30-day picture without them ever disagreeing on how
+    // a stat is defined.
+    const [today, last30] = await Promise.all([
+      computeMatchStatsSince(`date_trunc('day', NOW())`),
+      computeMatchStatsSince(`NOW() - INTERVAL '30 days'`)
+    ]);
 
-    // Distinct players needs p1+p2 unioned together, not added separately
-    // (the query above just double counts anyone who played both seats).
-    const uniquePlayers = await db.query(`
-      SELECT COUNT(DISTINCT uid) AS n FROM (
-        SELECT p1_user_id AS uid FROM paid_matches WHERE created_at >= NOW() - INTERVAL '30 days'
-        UNION
-        SELECT p2_user_id AS uid FROM paid_matches WHERE created_at >= NOW() - INTERVAL '30 days'
-      ) x
-    `);
-
-    // Top player by paid match count in the window
-    const topPaid = await db.query(`
-      SELECT u.id, u.username, COUNT(*)::int AS matches
-      FROM (
-        SELECT p1_user_id AS uid FROM paid_matches WHERE stake > 0 AND created_at >= NOW() - INTERVAL '30 days'
-        UNION ALL
-        SELECT p2_user_id AS uid FROM paid_matches WHERE stake > 0 AND created_at >= NOW() - INTERVAL '30 days'
-      ) x
-      JOIN users u ON u.id = x.uid
-      GROUP BY u.id, u.username
-      ORDER BY matches DESC
-      LIMIT 1
-    `);
-
-    // Top player by free match count in the window
-    const topFree = await db.query(`
-      SELECT u.id, u.username, COUNT(*)::int AS matches
-      FROM (
-        SELECT p1_user_id AS uid FROM paid_matches WHERE stake = 0 AND created_at >= NOW() - INTERVAL '30 days'
-        UNION ALL
-        SELECT p2_user_id AS uid FROM paid_matches WHERE stake = 0 AND created_at >= NOW() - INTERVAL '30 days'
-      ) x
-      JOIN users u ON u.id = x.uid
-      GROUP BY u.id, u.username
-      ORDER BY matches DESC
-      LIMIT 1
-    `);
-
-    const row = totals.rows[0] || {};
     res.json({
-      period_days: 30,
-      total_matches: Number(row.total_matches || 0),
-      free_matches: Number(row.free_matches || 0),
-      paid_matches: Number(row.paid_matches || 0),
-      bot_matches: Number(row.bot_matches || 0),
-      real_opponent_matches: Number(row.real_opponent_matches || 0),
-      unique_players: Number((uniquePlayers.rows[0] || {}).n || 0),
-      top_paid_player: topPaid.rows[0] || null,
-      top_free_player: topFree.rows[0] || null,
+      today,
+      last_30_days: last30,
       currently_active_matches: rooms.size,
       currently_active_players: rooms.size * 2,
       currently_online_sockets: io.engine ? io.engine.clientsCount : 0
@@ -6562,7 +6690,7 @@ app.get('/api/admin/users', adminOnly, async (req, res) => {
         u.balance, u.wallet_locked, u.coins,
         u.wins, u.losses, u.avatar,
         u.country, u.city, u.last_seen_at,
-        u.banned, u.ban_reason, u.banned_at,
+        u.banned, u.ban_reason, u.banned_at, u.is_chat_moderator,
         COUNT(pm.id)::int AS matches_count,
         COUNT(pm.id) FILTER (WHERE pm.winner_user_id=u.id)::int AS matches_won,
         COUNT(pm.id) FILTER (
@@ -6586,7 +6714,10 @@ app.get('/api/admin/users', adminOnly, async (req, res) => {
       coins: Number(u.coins || 0),
       wins: Number(u.wins || 0),
       losses: Number(u.losses || 0),
-      banned: !!u.banned
+      banned: !!u.banned,
+      is_chat_moderator: !!u.is_chat_moderator,
+      is_chat_moderator: !!u.is_chat_moderator,
+      is_chat_moderator: !!u.is_chat_moderator
     })) });
   } catch (e) {
     console.error('admin users error:', e.message);
@@ -6701,6 +6832,213 @@ app.post('/api/admin/users/:id/ban', adminOnly, async (req, res) => {
     res.json({ ok: true, user: updated.rows[0] });
   } catch (e) {
     console.error('admin ban error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/users/:id/message', adminOnly, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const message = String(req.body?.message || '').trim().slice(0, 1000);
+    if (!Number.isInteger(userId)) {
+      return res.status(400).json({ error: 'valid_user_id_required' });
+    }
+    if (!message) {
+      return res.status(400).json({ error: 'message_required' });
+    }
+
+    const userCheck = await db.query(`SELECT id FROM users WHERE id=$1`, [userId]);
+    if (!userCheck.rows.length) {
+      return res.status(404).json({ error: 'user_not_found' });
+    }
+
+    // Deliver live to any socket(s) this user currently has open (the same
+    // userId -> socketId tracking the ban feature uses), and mark it
+    // delivered right away. If they're offline, it's just left undelivered
+    // and picked up next time their client checks in via GET /api/my-messages.
+    const socketIds = userSockets.get(userId);
+    let delivered = false;
+    if (socketIds && socketIds.size) {
+      for (const socketId of socketIds) {
+        try {
+          const sock = io.sockets.sockets.get(socketId);
+          if (sock) {
+            sock.emit('admin_message', { message, created_at: new Date().toISOString() });
+            delivered = true;
+          }
+        } catch (e) {}
+      }
+    }
+
+    await db.query(`
+      INSERT INTO admin_messages (user_id, message, delivered_at)
+      VALUES ($1, $2, $3)
+    `, [userId, message, delivered ? new Date() : null]);
+
+    res.json({ ok: true, delivered_live: delivered });
+  } catch (e) {
+    console.error('admin message error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/users/:id/message', adminOnly, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const text = String(req.body?.text || '').trim().slice(0, 1000);
+    if (!Number.isInteger(userId)) {
+      return res.status(400).json({ error: 'valid_user_id_required' });
+    }
+    if (!text) {
+      return res.status(400).json({ error: 'text_required' });
+    }
+
+    const userCheck = await db.query(`SELECT id FROM users WHERE id=$1`, [userId]);
+    if (!userCheck.rows.length) {
+      return res.status(404).json({ error: 'user_not_found' });
+    }
+
+    // Insert first so we have a real id to hand to the live push below --
+    // the client marks a message read by id (POST /api/admin-messages/:id/read).
+    const inserted = await db.query(`
+      INSERT INTO admin_messages (user_id, text, delivered)
+      VALUES ($1, $2, false)
+      RETURNING id, created_at
+    `, [userId, text]);
+    const messageRow = inserted.rows[0];
+
+    // Try live delivery too (any socket this user currently has open) --
+    // if they're online they see it immediately instead of waiting for
+    // their next connect. Still left delivered=false in the DB either
+    // way; the client itself calls the /read endpoint once it's actually
+    // shown the message, which is the real signal it was seen.
+    const ids = userSockets.get(userId);
+    let deliveredLive = false;
+    if (ids && ids.size) {
+      for (const socketId of ids) {
+        const sock = io.sockets.sockets.get(socketId);
+        if (sock) {
+          sock.emit('admin_message', { id: messageRow.id, text, created_at: messageRow.created_at });
+          deliveredLive = true;
+        }
+      }
+    }
+
+    res.json({ ok: true, delivered_live: deliveredLive });
+  } catch (e) {
+    console.error('admin send message error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// The player's own client calls this on every connect/reconnect to pick
+// up any admin message that arrived while they were offline (the frontend
+// already expects exactly this path/shape).
+app.get('/api/admin-messages/unread', auth, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT id, text, created_at FROM admin_messages
+      WHERE user_id=$1 AND delivered=false
+      ORDER BY created_at ASC
+    `, [req.user.id]);
+
+    res.json({ messages: result.rows });
+  } catch (e) {
+    console.error('admin-messages/unread error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Client calls this right after showing a given message (live push or
+// from the unread list above) so it isn't shown again next time.
+// Scoped to the caller's own id -- you can only mark your own messages.
+app.post('/api/admin-messages/:id/read', auth, async (req, res) => {
+  try {
+    const messageId = Number(req.params.id);
+    if (!Number.isInteger(messageId)) {
+      return res.status(400).json({ error: 'valid_message_id_required' });
+    }
+    await db.query(`
+      UPDATE admin_messages SET delivered=true
+      WHERE id=$1 AND user_id=$2
+    `, [messageId, req.user.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('admin-messages/read error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/users/:id/chat-mod', adminOnly, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const isModerator = req.body?.is_chat_moderator;
+    if (!Number.isInteger(userId)) {
+      return res.status(400).json({ error: 'valid_user_id_required' });
+    }
+    if (typeof isModerator !== 'boolean') {
+      return res.status(400).json({ error: 'is_chat_moderator_boolean_required' });
+    }
+
+    const updated = await db.query(`
+      UPDATE users
+      SET is_chat_moderator=$1
+      WHERE id=$2
+      RETURNING id, is_chat_moderator
+    `, [isModerator, userId]);
+
+    if (!updated.rows.length) {
+      return res.status(404).json({ error: 'user_not_found' });
+    }
+
+    res.json({ ok: true, user: updated.rows[0] });
+  } catch (e) {
+    console.error('admin chat-mod error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/users/:id/message', adminOnly, async (req, res) => {
+  try {
+    const userId = Number(req.params.id);
+    const text = String(req.body?.text || '').trim().slice(0, 1000);
+    if (!Number.isInteger(userId)) {
+      return res.status(400).json({ error: 'valid_user_id_required' });
+    }
+    if (!text) {
+      return res.status(400).json({ error: 'text_required' });
+    }
+
+    const inserted = await db.query(`
+      INSERT INTO admin_messages (user_id, text)
+      VALUES ($1, $2)
+      RETURNING id, text, created_at
+    `, [userId, text]);
+
+    const message = inserted.rows[0];
+
+    // Deliver immediately if they're online right now; either way it's
+    // saved, so it's waiting for them next time they open the app even
+    // if this doesn't reach a live socket.
+    try {
+      const ids = userSockets.get(userId);
+      if (ids) {
+        for (const socketId of ids) {
+          const sock = io.sockets.sockets.get(socketId);
+          if (sock) {
+            sock.emit('admin_message', {
+              id: message.id,
+              text: message.text,
+              ts: new Date(message.created_at).getTime()
+            });
+          }
+        }
+      }
+    } catch (e) {}
+
+    res.json({ ok: true, message });
+  } catch (e) {
+    console.error('admin message error:', e.message);
     res.status(500).json({ error: 'server_error' });
   }
 });
@@ -8622,12 +8960,14 @@ io.on(
           // Persist so the /api/global-chat/history endpoint can show
           // it to people who open the app later (best-effort — a save
           // failure shouldn't block the live broadcast below).
+          let newMessageId = null;
           try {
-            await db.query(
+            const inserted = await db.query(
               `
               INSERT INTO global_chat_messages
                 (user_id, name, text)
               VALUES ($1, $2, $3)
+              RETURNING id
               `,
               [
                 tokenPayload.id,
@@ -8635,6 +8975,7 @@ io.on(
                 text
               ]
             );
+            newMessageId = inserted.rows[0] && inserted.rows[0].id;
           } catch (e) {
             console.error(
               'global_chat_messages insert error:',
@@ -8645,6 +8986,9 @@ io.on(
           io.emit(
             'global_chat_message',
             {
+              id:
+                newMessageId,
+
               userId:
                 tokenPayload.id,
 
@@ -8661,6 +9005,48 @@ io.on(
             'global_chat_message error:',
             e.message
           );
+        }
+      }
+    );
+
+    /* =====================================================
+       GLOBAL CHAT — MODERATION (delete a message)
+    ===================================================== */
+
+    socket.on(
+      'delete_global_chat_message',
+      async payload => {
+        try {
+          const tokenPayload = verifyMatchToken(payload?.token);
+          if (!tokenPayload || !tokenPayload.id) {
+            return emitMatchError(socket, 'login_required');
+          }
+
+          const messageId = Number(payload?.message_id);
+          if (!Number.isInteger(messageId)) {
+            return;
+          }
+
+          const modCheck = await db.query(
+            `SELECT is_chat_moderator FROM users WHERE id=$1`,
+            [tokenPayload.id]
+          );
+          if (!modCheck.rows.length || !modCheck.rows[0].is_chat_moderator) {
+            // Not a moderator -- silently ignore rather than error, since
+            // a regular user should never even see the delete option, so
+            // reaching here at all means something unusual (stale UI,
+            // tampered client, revoked moderator status mid-session).
+            return;
+          }
+
+          await db.query(
+            `UPDATE global_chat_messages SET deleted=true WHERE id=$1`,
+            [messageId]
+          );
+
+          io.emit('global_chat_message_deleted', { id: messageId });
+        } catch (e) {
+          console.error('delete_global_chat_message error:', e.message);
         }
       }
     );
@@ -9228,6 +9614,8 @@ async function startServer() {
 
     await initAdminUserTools();
 
+    await initAdminMessagesTable();
+
     await initTournamentTables();
 
     await initFakeLeaderboard();
@@ -9245,6 +9633,10 @@ async function startServer() {
     await initVisitTables();
 
     await initGlobalChatTable();
+
+    await initAdminMessagesTable();
+
+    await initAdminMessagesTable();
 
     await initTelegramJoinTable();
 
