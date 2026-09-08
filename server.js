@@ -5050,6 +5050,15 @@ async function initClientErrorsTable() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await db.query(`
+    ALTER TABLE client_errors
+      ADD COLUMN IF NOT EXISTS match_id INTEGER,
+      ADD COLUMN IF NOT EXISTS room_id TEXT
+  `);
+  await db.query(`
+    ALTER TABLE paid_matches
+      ADD COLUMN IF NOT EXISTS dispute_reason TEXT
+  `);
   // Errors happen in bursts (one bad frame can log the same message dozens
   // of times) -- keep only the last 2000 rows so this can never grow into
   // a real storage/performance problem left unattended.
@@ -5455,20 +5464,50 @@ app.post('/api/client-error', async (req, res) => {
     const stack = String(req.body?.stack || '').slice(0, 2000);
     const userAgent = String(req.headers['user-agent'] || '').slice(0, 300);
     const url = String(req.body?.url || '').slice(0, 300);
+    const matchId = Number.isInteger(req.body?.match_id) ? req.body.match_id : null;
+    const roomId = req.body?.room_id ? String(req.body.room_id).slice(0, 100) : null;
 
     if (!message) return res.status(400).json({ ok: false });
 
-    console.error('[CLIENT ERROR] ' + message + ' @ ' + source + ':' + line + ':' + col + (userId ? ' userId=' + userId : ''));
+    console.error('[CLIENT ERROR] ' + message + ' @ ' + source + ':' + line + ':' + col + (userId ? ' userId=' + userId : '') + (roomId ? ' room=' + roomId : ''));
 
     await db.query(`
-      INSERT INTO client_errors (message, source, line, col, stack, user_id, user_agent, url)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-    `, [message, source, line, col, stack, userId, userAgent, url]);
+      INSERT INTO client_errors (message, source, line, col, stack, user_id, user_agent, url, match_id, room_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+    `, [message, source, line, col, stack, userId, userAgent, url, matchId, roomId]);
 
     res.json({ ok: true });
   } catch (e) {
     // Never let error-reporting itself become a source of errors the
     // player can see -- always respond ok-ish and move on.
+    res.status(200).json({ ok: false });
+  }
+});
+
+// The client calls this the moment IT detects a freeze it can't recover
+// from on its own (e.g. draw_tile_result never arrived after every retry,
+// or the opponent hasn't moved in 45s+) -- so an admin sees the match
+// flagged as "disputed" immediately, instead of it sitting silently as
+// "active" until someone happens to check, or the 30-minute auto-refund
+// safety net eventually catches it. Best-effort and non-authoritative:
+// this never itself declares a winner/loser or touches money, it only
+// raises a flag for a human (or the auto-refund job) to act on.
+app.post('/api/report-stuck-match', auth, async (req, res) => {
+  try {
+    const matchId = Number(req.body?.match_id);
+    const reason = String(req.body?.reason || 'client_detected_freeze').slice(0, 200);
+    if (!Number.isInteger(matchId)) return res.status(400).json({ ok: false });
+
+    await db.query(`
+      UPDATE paid_matches
+      SET status = 'disputed',
+          dispute_reason = $1,
+          updated_at = NOW()
+      WHERE id = $2 AND status = 'active'
+    `, [reason, matchId]);
+
+    res.json({ ok: true });
+  } catch (e) {
     res.status(200).json({ ok: false });
   }
 });
