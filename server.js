@@ -9544,15 +9544,49 @@ io.on(
             ' userId=' + userId + ' seat=' + pending.seatIdx +
             ' newSocket=' + socket.id + ' missed=' + missed.length);
 
+          // A client resuming after a genuine soft reconnect (socket drop,
+          // page never reloaded) still has its game screen up and only
+          // needs the moves it missed. A client resuming after a full page
+          // reload has NOTHING on screen yet -- it needs the complete
+          // picture: everything online_start would have sent, plus the
+          // round's entire move log replayed from the very start, not just
+          // what happened since the last disconnect.
+          const needsFullRebuild = !(payload && payload.hasExistingGame);
+
+          const opponentSeatIdx = pending.seatIdx === 0 ? 1 : 0;
+          const opponentUserId = room.userIds ? room.userIds[opponentSeatIdx] : null;
+          let opponentInfo = null;
+          if (needsFullRebuild && opponentUserId) {
+            try {
+              const oppRow = await db.query(
+                `SELECT username, avatar, photo_url FROM users WHERE id=$1`,
+                [opponentUserId]
+              );
+              if (oppRow.rows.length) {
+                opponentInfo = {
+                  name: oppRow.rows[0].username,
+                  avatar: oppRow.rows[0].avatar,
+                  photo_url: oppRow.rows[0].photo_url
+                };
+              }
+            } catch (e) {}
+          }
+
           socket.emit('resume_result', {
             ok: true,
             match_id: room.matchId,
             room_id: pending.roomId,
             seat: pending.seatIdx,
+            needsFullRebuild,
+            goal: room.goal,
+            stake: room.stake,
+            prize: room.prize,
+            opponent: opponentInfo,
             resync: {
               yourHand: room.hands[pending.seatIdx],
               boneyardCount: room.boneyard.length,
-              missed
+              totalBoardMoves: (room.log || []).filter(e => e && e.type === 'move').length,
+              missed: needsFullRebuild ? (room.log || []) : missed
             }
           });
 
