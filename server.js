@@ -5247,6 +5247,38 @@ async function initClientErrorsTable() {
 // Checking rooms.has() (not just elapsed time) means a real, unusually
 // long game in progress is never touched -- it always still has a live
 // room -- this only catches matches that are truly orphaned.
+// Server-side backstop for a frozen match: everything else that detects
+// "stuck" (the opponent-not-responding watchdog, the auto-play timer, the
+// draw/move retry logic) runs as JS timers in the PLAYER's own browser --
+// and mobile browsers commonly throttle or fully pause those timers once
+// a tab is backgrounded or the screen locks, which a player waiting on
+// their opponent's turn might well do. The server has no such throttling,
+// so it's the one place a stall can still be caught reliably. If a room
+// tied to an active paid match has had zero moves/draws for a while, flag
+// it the same way a client-detected freeze already does.
+async function checkStalledPaidMatches() {
+  try {
+    const STALE_MS = 4 * 60 * 1000; // 4 minutes with no board activity
+    const now = Date.now();
+    for (const [roomId, room] of rooms.entries()) {
+      if (!room.matchId) continue; // free/offline match, nothing to flag
+      const last = room.lastActivityAt || 0;
+      if (now - last < STALE_MS) continue;
+      if (room._flaggedStalled) continue; // already flagged this room once
+      room._flaggedStalled = true;
+      await db.query(`
+        UPDATE paid_matches
+        SET status = 'disputed',
+            dispute_reason = $1,
+            updated_at = NOW()
+        WHERE id = $2 AND status = 'active'
+      `, ['server_detected_inactivity', room.matchId]);
+    }
+  } catch (e) {
+    console.error('checkStalledPaidMatches error:', e.message);
+  }
+}
+
 async function autoRefundOrphanedPaidMatches() {
   try {
     const result = await db.query(`
@@ -8397,7 +8429,10 @@ io.on(
               ],
 
               log:
-                []
+                [],
+
+              lastActivityAt:
+                Date.now()
             };
 
             rooms.set(
@@ -8611,6 +8646,7 @@ io.on(
             boneyard_left: room.boneyard.length
           });
         }
+        room.lastActivityAt = Date.now();
 
         const result = {
           ok: true,
@@ -8931,6 +8967,7 @@ io.on(
             rotation: message && message.rotation
           });
         }
+        room.lastActivityAt = Date.now();
 
         const opponent =
           otherPlayer(
@@ -9468,6 +9505,8 @@ async function startServer() {
     setInterval(tickFakeLeaderboard, 60 * 1000);
 
     setInterval(autoRefundOrphanedPaidMatches, 5 * 60 * 1000);
+
+    setInterval(checkStalledPaidMatches, 60 * 1000);
 
     // One-time cleanup: clear any stale fake_reset_period marker so the
     // next tournament view definitely triggers a fresh atomic reset.
