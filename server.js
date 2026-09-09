@@ -9048,7 +9048,20 @@ io.on(
             if (deliveryAttempt < 4) {
               deliverToOpponent(deliveryAttempt + 1);
             } else {
-              console.error('[game_move] opponent never acked delivery after ' + deliveryAttempt + ' attempts, room=' + roomId);
+              // The opponent's socket is technically still "connected" from
+              // the server's point of view, but their client is genuinely
+              // not receiving anything (backgrounded tab, frozen JS, dead
+              // radio link that hasn't dropped yet). Leaving this silent
+              // stranded both players forever with only a client-side
+              // 45s "leave match" button as an escape hatch. Instead, run
+              // the exact same reconnect-grace / forfeit path used for a
+              // real disconnect -- treat a truly unresponsive opponent the
+              // same as a dropped one, so the match resolves on its own
+              // instead of hanging indefinitely.
+              console.error('[game_move] opponent never acked delivery after ' + deliveryAttempt + ' attempts, room=' + roomId + ' -- treating opponent as disconnected');
+              handlePlayerLeftRoom(opponent).catch(e => {
+                console.error('[game_move] handlePlayerLeftRoom(opponent) after delivery failure error:', e.message);
+              });
             }
           }, 4000);
         }
@@ -9304,13 +9317,24 @@ io.on(
             result.status ===
             'disputed'
           ) {
+            // Reports disagree on the winner (client-side desync). Don't
+            // leave the stake stuck waiting on a manual admin refund --
+            // return it to both players automatically, immediately.
+            try {
+              const refunded = await refundPaidMatch(room.matchId);
+              console.log('[report_result] disputed match auto-refunded, matchId=' + room.matchId + ' ok=' + refunded);
+            } catch (e) {
+              console.error('[report_result] auto-refund failed, matchId=' + room.matchId + ' error=' + e.message);
+            }
+
             io.to(
               roomId
             ).emit(
               'match_disputed',
               {
                 match_id:
-                  room.matchId
+                  room.matchId,
+                auto_refunded: true
               }
             );
           }
