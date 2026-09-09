@@ -9388,6 +9388,37 @@ io.on(
     // brief mobile signal drop: the client reconnects with a NEW socket id,
     // and this swaps that new id into the parked room in place of the dead
     // one, so play continues instead of the player being forfeited.
+    // A still-CONNECTED client can end up with a desynced board (e.g. its
+    // side-of-chain tracking got out of step somehow) without ever having
+    // actually disconnected -- so it can't use resume_match's replay path,
+    // which only exists for a genuine reconnect. This gives any connected
+    // player in an active room the SAME replay data (the whole current
+    // round's log, from the start) so their client can rebuild the board
+    // from scratch and be guaranteed correct, regardless of what state it
+    // was in before asking.
+    socket.on(
+      'request_board_sync',
+      (payload) => {
+        try {
+          const roomId = socketRoom.get(socket.id);
+          if (!roomId) { socket.emit('board_sync_result', { ok: false }); return; }
+          const room = rooms.get(roomId);
+          if (!room) { socket.emit('board_sync_result', { ok: false }); return; }
+          const seat = room.players[0] === socket.id ? 0 : 1;
+          socket.emit('board_sync_result', {
+            ok: true,
+            seat,
+            yourHand: room.hands[seat],
+            boneyardCount: room.boneyard.length,
+            log: room.log || []
+          });
+        } catch (e) {
+          console.error('request_board_sync error:', e.message);
+          socket.emit('board_sync_result', { ok: false });
+        }
+      }
+    );
+
     socket.on(
       'resume_match',
       async (payload) => {
