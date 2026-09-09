@@ -1061,10 +1061,42 @@ app.post(
    LOGIN
 ========================================================= */
 
+// Simple in-memory brute-force guard for login: too many failed attempts
+// from the same IP in a short window blocks further tries for a while.
+// Not a replacement for a real rate-limiting service, but with real money
+// on accounts, unlimited password guessing is worth closing off even with
+// something this basic.
+const loginAttempts = new Map(); // ip -> { count, firstAttemptAt }
+const LOGIN_MAX_ATTEMPTS = 10;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+
+function checkLoginRateLimit(ip) {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now - entry.firstAttemptAt > LOGIN_WINDOW_MS) {
+    loginAttempts.set(ip, { count: 1, firstAttemptAt: now });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= LOGIN_MAX_ATTEMPTS;
+}
+
+// Occasionally clear old entries so this map doesn't grow forever.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of loginAttempts.entries()) {
+    if (now - entry.firstAttemptAt > LOGIN_WINDOW_MS) loginAttempts.delete(ip);
+  }
+}, 30 * 60 * 1000);
+
 app.post(
   '/api/login',
   async (req, res) => {
     try {
+      const loginIp = getClientIp(req);
+      if (!checkLoginRateLimit(loginIp)) {
+        return res.status(429).json({ error: 'too_many_attempts' });
+      }
       let {
         email,
         password
@@ -9239,11 +9271,10 @@ io.on(
               i < 2;
               i++
             ) {
-              io.to(
+              emitWithRetry(
                 room.players[
                   i
-                ]
-              ).emit(
+                ],
                 'match_settled',
                 {
                   match_id:
