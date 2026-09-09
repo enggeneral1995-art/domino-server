@@ -7936,6 +7936,28 @@ function queueKey(
    START ROUND
 ========================================================= */
 
+// For a message where losing it is serious enough that it's worth a few
+// retries (the initial deal being the clearest case -- without it a
+// player has no tiles and no idea a match even started), emit directly to
+// the socket with an ack, and resend if that ack doesn't come back in
+// time. io.to(socketId).emit(...) can't take an ack callback the way a
+// direct socket.emit() can, so this looks the socket up itself.
+function emitWithRetry(socketId, event, payload, attempt) {
+  attempt = attempt || 1;
+  const sock = io.sockets.sockets.get(socketId);
+  if (!sock) return; // they're gone; nothing more we can do here
+  let acked = false;
+  sock.emit(event, payload, () => { acked = true; });
+  setTimeout(() => {
+    if (acked) return;
+    if (attempt < 5) {
+      emitWithRetry(socketId, event, payload, attempt + 1);
+    } else {
+      console.error('[emitWithRetry] ' + event + ' never acked after ' + attempt + ' attempts, socket=' + socketId);
+    }
+  }, 3000);
+}
+
 function startRound(room) {
   const round =
     dealRound();
@@ -7958,9 +7980,8 @@ function startRound(room) {
   // cover the round currently in progress.
   room.log = [];
 
-  io.to(
-    room.players[0]
-  ).emit(
+  emitWithRetry(
+    room.players[0],
     'online_start',
     {
       seat: 0,
@@ -7992,9 +8013,8 @@ function startRound(room) {
     }
   );
 
-  io.to(
-    room.players[1]
-  ).emit(
+  emitWithRetry(
+    room.players[1],
     'online_start',
     {
       seat: 1,
