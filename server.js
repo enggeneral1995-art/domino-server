@@ -8980,12 +8980,27 @@ io.on(
           return;
         }
 
-        io.to(
-          opponent
-        ).emit(
-          'game_move',
-          message
-        );
+        // Confirming with the SENDER only proves the server got the move --
+        // it says nothing about whether the opponent's client actually
+        // received the broadcast below. Get an ack from THEM too, and
+        // retry delivery a few times if it doesn't arrive, so a move that
+        // silently fails to reach the opponent doesn't leave them waiting
+        // on a turn that (from their side) never happened.
+        function deliverToOpponent(deliveryAttempt) {
+          const opponentSocket = io.sockets.sockets.get(opponent);
+          if (!opponentSocket) return; // they're gone; resume/forfeit flow handles this separately
+          let delivered = false;
+          opponentSocket.emit('game_move', message, () => { delivered = true; });
+          setTimeout(() => {
+            if (delivered) return;
+            if (deliveryAttempt < 4) {
+              deliverToOpponent(deliveryAttempt + 1);
+            } else {
+              console.error('[game_move] opponent never acked delivery after ' + deliveryAttempt + ' attempts, room=' + roomId);
+            }
+          }, 4000);
+        }
+        deliverToOpponent(1);
 
         if (typeof ack === 'function') ack({ ok: true });
       }
