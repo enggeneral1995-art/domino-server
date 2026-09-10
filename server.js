@@ -8297,6 +8297,95 @@ function tileFitsEnd(value, endValue) {
   return !!t && endValue != null && (t[0] === endValue || t[1] === endValue);
 }
 
+/* =========================================================
+   AUTHORITATIVE STATE BROADCAST
+
+   The old design sent only what CHANGED ("seat 1 played tile 12 on the
+   left") and let each phone maintain its own copy of the board. That works
+   right up until one message is lost, delayed, or applied twice -- after
+   which the two phones are playing different games, and every later move
+   makes it worse. It is exactly why a match against the bot (one copy of
+   the game) never glitched while a match against a person (three copies:
+   server + two phones) did.
+
+   These functions send the WHOLE position after every change instead. A
+   phone that missed ten messages is fixed by the next one, because the
+   next one is the complete truth rather than an increment on top of
+   whatever it happened to be holding. There is nothing left to fall out
+   of step with.
+
+   Each seat gets its own view: full detail on its own hand, only a count
+   for the opponent's, so the state can be sent freely without leaking the
+   opponent's tiles.
+========================================================= */
+
+function boardChainFor(room) {
+  // room.log holds the ordered moves; rebuild the visible chain from it so
+  // the phone never has to work out orientation for itself.
+  const chain = [];
+  for (const entry of (room.log || [])) {
+    if (!entry || entry.type !== 'move') continue;
+    chain.push({
+      value: entry.value,
+      side: entry.side,
+      rotation: entry.rotation,
+      seat: entry.seat
+    });
+  }
+  return chain;
+}
+
+function stateForSeat(room, seat) {
+  const opp = seat === 0 ? 1 : 0;
+  const hand = (room.hands && room.hands[seat]) || [];
+  const oppHand = (room.hands && room.hands[opp]) || [];
+
+  return {
+    // Monotonic: a phone can ignore a state older than one it already
+    // applied, so an out-of-order delivery can never rewind the board.
+    stateSerial: room.stateSerial || 0,
+    roundSerial: room.roundSerial || 0,
+
+    seat,
+    goal: room.goal,
+    scores: Array.isArray(room.scores) ? room.scores.slice() : [0, 0],
+
+    board: boardChainFor(room),
+    leftEnd: room.leftEnd,
+    rightEnd: room.rightEnd,
+
+    yourHand: hand.slice(),
+    oppHandCount: oppHand.length,
+    boneyardCount: (room.boneyard || []).length,
+
+    turnSeat: room.turnSeat,
+    yourTurn: room.turnSeat === seat,
+    turnDeadline: room.turnDeadline || null,
+
+    matchId: room.matchId || null,
+    stake: room.stake,
+    prize: room.prize
+  };
+}
+
+/**
+ * Send the current position to both seats. Call this after ANY change to
+ * the room -- a move, a draw, a pass, a new round, a reconnect. Sending it
+ * more often than strictly necessary is cheap and is the whole safety
+ * property: the phones are never more than one message away from correct.
+ */
+function broadcastState(room, reason) {
+  if (!room || !Array.isArray(room.players)) return;
+  room.stateSerial = (room.stateSerial || 0) + 1;
+  for (let seat = 0; seat < 2; seat++) {
+    const sid = room.players[seat];
+    if (!sid) continue;
+    const payload = stateForSeat(room, seat);
+    payload.reason = reason || 'update';
+    io.to(sid).emit('game_state', payload);
+  }
+}
+
 function hasLegalMove(room, seat) {
   const hand = room && room.hands && room.hands[seat];
   if (!hand) return false;
@@ -8376,6 +8465,9 @@ function performServerAutoTurn(room, seat) {
     if (sid) io.to(sid).emit('server_auto_actions', { roundSerial: room.roundSerial, seat, actions, turnSeat: room.turnSeat });
   }
   armRoomTurnTimer(room);
+  // The delta above is kept only so an older phone still works. The state
+  // below is what a current phone actually renders from.
+  broadcastState(room, 'auto_turn');
 }
 
 function clearRoomTurnTimer(room) {
@@ -8501,6 +8593,7 @@ function startRound(room) {
   );
 
   armRoomTurnTimer(room);
+  broadcastState(room, 'round_start');
 }
 
 function emitMatchError(
@@ -9139,6 +9232,7 @@ io.on(
         }
         room.lastActivityAt = Date.now();
         armRoomTurnTimer(room);
+        broadcastState(room, 'draw');
 
         const result = {
           ok: true,
@@ -9485,6 +9579,7 @@ io.on(
           while (moveNonceMap.size > 64) moveNonceMap.delete(moveNonceMap.keys().next().value);
         }
         armRoomTurnTimer(room);
+        broadcastState(room, 'move');
 
         const opponent =
           otherPlayer(
@@ -10189,6 +10284,14 @@ io.on(
               missed: needsFullRebuild ? [] : missed
             }
           });
+
+          // The resync block above is the old replay-based recovery, kept
+          // so an older phone still works. Follow it immediately with the
+          // authoritative position: a current phone renders that and is
+          // correct at once, with nothing to replay and nothing to get
+          // wrong. This is the case that used to strand players on
+          // "Connecting..." until they lost the match.
+          broadcastState(room, 'resume');
 
         } catch (e) {
           console.error('resume_match error:', e.message);
