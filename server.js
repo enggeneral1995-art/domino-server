@@ -7955,12 +7955,13 @@ function otherPlayer(
   room,
   socketId
 ) {
-  return (
-    room.players[0] ===
-    socketId
-  )
-    ? room.players[1]
-    : room.players[0];
+  if (!room || !Array.isArray(room.players)) return null;
+  const seat = room.players.indexOf(socketId);
+  if (seat === 0) return room.players[1] || null;
+  if (seat === 1) return room.players[0] || null;
+  // Never guess a seat for a stale/replaced socket. Guessing here can award
+  // a paid forfeit to the wrong player during a reconnect race.
+  return null;
 }
 
 // Shared by the 'disconnect' handler and the explicit 'leave_match' event:
@@ -8046,7 +8047,7 @@ async function handlePlayerLeftRoom(socketId, opts) {
   // before we forfeit their match. Only for real tracked matches — an
   // untracked/free-floating room has nothing worth preserving.
   if (!immediate && hasTrackedMatch) {
-    const seatIdx = room.players[0] === socketId ? 0 : 1;
+    const seatIdx = actualSeatIdx;
     const userId = room.userIds[seatIdx];
     const key = reconnectKey(roomId, userId);
 
@@ -8069,8 +8070,16 @@ async function handlePlayerLeftRoom(socketId, opts) {
       pendingReconnects.delete(key);
       // Still gone after the grace window — run the real forfeit.
       if (rooms.has(roomId)) {
+        // Only forfeit if this exact dead socket still owns the same seat.
+        // A successful resume replaces room.players[seatIdx]; an old timeout
+        // firing afterwards must become a harmless no-op.
+        const liveRoom = rooms.get(roomId);
+        if (!liveRoom || liveRoom.players[seatIdx] !== socketId ||
+            Number(liveRoom.userIds && liveRoom.userIds[seatIdx]) !== Number(userId)) {
+          return;
+        }
         socketRoom.set(socketId, roomId);
-        await finalizePlayerLeftRoom(socketId);
+        await finalizePlayerLeftRoom(socketId, { expectedSeatIdx: seatIdx, expectedUserId: userId });
       }
     }, RECONNECT_GRACE_MS);
 
@@ -8091,11 +8100,23 @@ async function handlePlayerLeftRoom(socketId, opts) {
   await finalizePlayerLeftRoom(socketId);
 }
 
-async function finalizePlayerLeftRoom(socketId) {
+async function finalizePlayerLeftRoom(socketId, guard) {
   const roomId = socketRoom.get(socketId);
   if (!roomId || !rooms.has(roomId)) return;
 
   const room = rooms.get(roomId);
+
+  // Reconnect-race guard: a timeout belonging to an OLD socket must never
+  // settle a room after that seat has already been reclaimed by a new socket.
+  const actualSeatIdx = Array.isArray(room.players) ? room.players.indexOf(socketId) : -1;
+  if (actualSeatIdx < 0) {
+    socketRoom.delete(socketId);
+    return;
+  }
+  if (guard && guard.expectedSeatIdx != null && actualSeatIdx !== Number(guard.expectedSeatIdx)) return;
+  if (guard && guard.expectedUserId != null &&
+      Number(room.userIds && room.userIds[actualSeatIdx]) !== Number(guard.expectedUserId)) return;
+
   // Idempotency: disconnect timeout, explicit leave and duplicate socket
   // events must never settle/refund the same money match twice.
   if (room.finalizing) return;
@@ -10289,8 +10310,7 @@ io.on(
           // so an older phone still works. Follow it immediately with the
           // authoritative position: a current phone renders that and is
           // correct at once, with nothing to replay and nothing to get
-          // wrong. This is the case that used to strand players on
-          // "Connecting..." until they lost the match.
+          // wrong.
           broadcastState(room, 'resume');
 
         } catch (e) {
