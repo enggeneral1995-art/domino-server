@@ -1650,11 +1650,6 @@ async function initAppConfig() {
   await db.query(`
     ALTER TABLE app_config ADD COLUMN IF NOT EXISTS bot_difficulty TEXT NOT NULL DEFAULT 'hard'
   `);
-  // Lets the admin close the public lobby chat without a redeploy.
-  // Defaults to open so an existing install behaves exactly as before.
-  await db.query(`
-    ALTER TABLE app_config ADD COLUMN IF NOT EXISTS chat_enabled BOOLEAN NOT NULL DEFAULT true
-  `);
   await db.query(`
     INSERT INTO app_config (id, paid_enabled, online_baseline)
     VALUES (1, true, 1000)
@@ -1897,13 +1892,12 @@ async function isPaidEnabled() {
 app.get('/api/app-config', async (req, res) => {
   try {
     const cfg = await db.query(
-      `SELECT paid_enabled, online_baseline, paid_schedule_enabled, paid_open_time, paid_close_time, paid_timezone, bot_enabled, bot_difficulty, chat_enabled
+      `SELECT paid_enabled, online_baseline, paid_schedule_enabled, paid_open_time, paid_close_time, paid_timezone, bot_enabled, bot_difficulty
        FROM app_config WHERE id=1`
     );
     const row = cfg.rows[0] || {};
     res.json({
       paid_enabled: row.paid_enabled !== false,
-      chat_enabled: row.chat_enabled !== false,
       online_baseline: row.online_baseline != null ? Number(row.online_baseline) : 1000,
       paid_schedule_enabled: !!row.paid_schedule_enabled,
       paid_open_time: row.paid_open_time || '20:00',
@@ -1917,7 +1911,7 @@ app.get('/api/app-config', async (req, res) => {
       paid_live_now: await isPaidEnabled()
     });
   } catch (e) {
-    res.json({ paid_enabled: true, chat_enabled: true, online_baseline: 1000, paid_schedule_enabled: false, paid_open_time: '20:00', paid_close_time: '00:00', paid_timezone: 'Asia/Baghdad', bot_enabled: false, bot_difficulty: 'hard', paid_live_now: true });
+    res.json({ paid_enabled: true, online_baseline: 1000, paid_schedule_enabled: false, paid_open_time: '20:00', paid_close_time: '00:00', paid_timezone: 'Asia/Baghdad', bot_enabled: false, bot_difficulty: 'hard', paid_live_now: true });
   }
 });
 
@@ -1942,7 +1936,6 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
     const timezone = req.body?.paid_timezone;
     const botEnabled = req.body?.bot_enabled;
     const botDifficulty = req.body?.bot_difficulty;
-    const chatEnabled = req.body?.chat_enabled;
 
     const hasPaid = typeof paidEnabled === 'boolean';
     const hasBaseline = onlineBaseline !== undefined && onlineBaseline !== null;
@@ -1953,9 +1946,8 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
     const hasTimezone = typeof timezone === 'string' && timezone.trim() !== '';
     const hasBotEnabled = typeof botEnabled === 'boolean';
     const hasBotDifficulty = typeof botDifficulty === 'string' && botDifficulty.trim() !== '';
-    const hasChatEnabled = typeof chatEnabled === 'boolean';
 
-    if (!hasPaid && !hasBaseline && !hasSchedule && !hasOpenTime && !hasCloseTime && !hasTimezone && !hasBotEnabled && !hasBotDifficulty && !hasChatEnabled) {
+    if (!hasPaid && !hasBaseline && !hasSchedule && !hasOpenTime && !hasCloseTime && !hasTimezone && !hasBotEnabled && !hasBotDifficulty) {
       return res.status(400).json({ error: 'nothing_to_update' });
     }
     if (hasBaseline && (!Number.isInteger(onlineBaseline) || onlineBaseline < 0)) {
@@ -1987,7 +1979,6 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
           paid_timezone=COALESCE($6, paid_timezone),
           bot_enabled=COALESCE($7, bot_enabled),
           bot_difficulty=COALESCE($8, bot_difficulty),
-          chat_enabled=COALESCE($9, chat_enabled),
           updated_at=NOW()
       WHERE id=1
     `, [
@@ -1998,15 +1989,8 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
       hasCloseTime ? closeTime : null,
       hasTimezone ? timezone : null,
       hasBotEnabled ? botEnabled : null,
-      hasBotDifficulty ? botDifficulty.trim().toLowerCase() : null,
-      hasChatEnabled ? chatEnabled : null
+      hasBotDifficulty ? botDifficulty.trim().toLowerCase() : null
     ]);
-
-    // Tell everyone who is online right now, so the chat opens or closes
-    // immediately instead of only for people who reload afterwards.
-    if (hasChatEnabled) {
-      try { io.emit('chat_enabled_changed', { enabled: chatEnabled }); } catch (e) {}
-    }
 
     res.json({ ok: true });
   } catch (e) {
@@ -9411,18 +9395,6 @@ io.on(
               socket,
               'login_required'
             );
-          }
-
-          // Enforce the closed chat HERE, not just by hiding the input box.
-          // Anyone can reopen a hidden box from a console; the only place a
-          // rule actually holds is the server.
-          try {
-            const chatCfg = await db.query('SELECT chat_enabled FROM app_config WHERE id=1');
-            if (chatCfg.rows.length && chatCfg.rows[0].chat_enabled === false) {
-              return emitMatchError(socket, 'chat_closed');
-            }
-          } catch (e) {
-            // A config read failure must not silence the chat.
           }
 
           const rawText =
