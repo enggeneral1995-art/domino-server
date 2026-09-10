@@ -8047,7 +8047,19 @@ async function handlePlayerLeftRoom(socketId, opts) {
   // before we forfeit their match. Only for real tracked matches — an
   // untracked/free-floating room has nothing worth preserving.
   if (!immediate && hasTrackedMatch) {
-    const seatIdx = actualSeatIdx;
+    // Work out the seat HERE. This used to read `actualSeatIdx`, which is
+    // declared in finalizePlayerLeftRoom, not in this function -- so every
+    // disconnect threw a ReferenceError right here and the room was never
+    // parked. That is why a dropped player's resume was answered with
+    // "no_match_to_resume" and an empty parked list, and why they sat on
+    // "Connecting..." until the grace window expired and they lost.
+    const seatIdx = Array.isArray(room.players) ? room.players.indexOf(socketId) : -1;
+    if (seatIdx < 0) {
+      // The socket no longer owns a seat (already replaced by a reconnect):
+      // nothing to park, and nothing to forfeit.
+      socketRoom.delete(socketId);
+      return;
+    }
     const userId = room.userIds[seatIdx];
     const key = reconnectKey(roomId, userId);
 
@@ -9550,7 +9562,15 @@ io.on(
           return;
         }
 
-        const seat = room.players[0] === socket.id ? 0 : 1;
+        // Resolve the seat by looking the socket UP, never by assuming
+        // "not seat 0 therefore seat 1". A stale socket that no longer owns
+        // a seat would otherwise be treated as seat 1 and could move on
+        // behalf of a player who is sitting there perfectly happily.
+        const seat = Array.isArray(room.players) ? room.players.indexOf(socket.id) : -1;
+        if (seat < 0) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'not_in_room' });
+          return;
+        }
         const type = message && message.type;
         const value = Number(message && message.value);
 
@@ -10068,7 +10088,10 @@ io.on(
           if (!roomId) { socket.emit('board_sync_result', { ok: false }); return; }
           const room = rooms.get(roomId);
           if (!room) { socket.emit('board_sync_result', { ok: false }); return; }
-          const seat = room.players[0] === socket.id ? 0 : 1;
+          // Same reason as game_move: never assume seat 1 for a socket we
+          // can't actually find, or we'd hand it the wrong player's hand.
+          const seat = Array.isArray(room.players) ? room.players.indexOf(socket.id) : -1;
+          if (seat < 0) { socket.emit('board_sync_result', { ok: false }); return; }
           socket.emit('board_sync_result', {
             ok: true,
             seat,
