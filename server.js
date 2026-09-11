@@ -5532,12 +5532,14 @@ async function getDisplayLeaderboard(periodStr, limit, tiers) {
   }));
   // Every real winner is always shown, full stop -- a real free-play win
   // must never be invisible just because the operator's cosmetic seeded
-  // (fake) rows have bigger, always-climbing numbers. Fake rows only fill
-  // whatever room is left after all real rows, so a real player with a
-  // handful of wins can no longer be silently crowded off a leaderboard
-  // that looks -- correctly, per the fraud-check tool -- like it's
-  // crediting them, while the page they'd actually check never shows them.
-  const fakeSlots = Math.max(0, (limit || 50) - realRows.length);
+  // (fake) rows have bigger, always-climbing numbers. On top of that,
+  // always reserve a minimum number of seeded slots too, regardless of
+  // how many real winners there are this week -- otherwise a week with
+  // more than `limit` real winners pushed every seeded row off the page
+  // (the whole point of the seeded rows -- keeping the page looking
+  // populated -- was defeated by having too MANY real winners).
+  const MIN_FAKE_SLOTS = 12;
+  const fakeSlots = Math.max(MIN_FAKE_SLOTS, (limit || 50) - realRows.length);
   const fakeRows = fake.slice(0, fakeSlots).map(f => ({
     user_id: null,
     fake_id: f.id,
@@ -5552,7 +5554,9 @@ async function getDisplayLeaderboard(periodStr, limit, tiers) {
   // "rank" here is just the visual position in the mixed list (for display
   // order only) — real_rank is the one real users should ever see next to
   // their own name, since that's the number that determines their payout.
-  return combined.slice(0, limit || 50).map((row, i) => ({
+  // No further truncation: every real winner and the reserved fake slots
+  // above are already the exact set meant to be shown.
+  return combined.map((row, i) => ({
     ...row,
     rank: i + 1
   }));
