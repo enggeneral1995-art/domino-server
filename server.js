@@ -5538,7 +5538,7 @@ async function getDisplayLeaderboard(periodStr, limit, tiers) {
   // more than `limit` real winners pushed every seeded row off the page
   // (the whole point of the seeded rows -- keeping the page looking
   // populated -- was defeated by having too MANY real winners).
-  const MIN_FAKE_SLOTS = 12;
+  const MIN_FAKE_SLOTS = 31;
   const fakeSlots = Math.max(MIN_FAKE_SLOTS, (limit || 50) - realRows.length);
   const fakeRows = fake.slice(0, fakeSlots).map(f => ({
     user_id: null,
