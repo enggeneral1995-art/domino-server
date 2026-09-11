@@ -4265,6 +4265,22 @@ app.get(
   adminOnly,
   async (_req, res) => {
     try {
+      const totalsResult =
+        await db.query(
+          `
+          SELECT
+            COALESCE(SUM(amount), 0)::float8 AS total_volume,
+            COUNT(*) FILTER (
+              WHERE type='deposit' AND status IN ('pending','review')
+            )::int AS pending_deposits_count,
+            COUNT(*) FILTER (
+              WHERE type='withdraw' AND status='pending'
+            )::int AS pending_withdrawals_count
+          FROM wallet_transactions
+          `
+        );
+      const totals = totalsResult.rows[0] || {};
+
       const result =
         await db.query(
           `
@@ -4291,9 +4307,49 @@ app.get(
           `
         );
 
+      // The 200-row list above is a recent-activity feed, fine for a
+      // dashboard glance -- but a pending deposit or withdrawal is a task
+      // someone still has to act on, and it must never fall out of reach
+      // just because 200 newer transactions happened after it. Fetch
+      // every still-pending item separately (unbounded: there are only
+      // ever as many as haven't been resolved yet, which is small) and
+      // let the client merge them in.
+      const pendingResult =
+        await db.query(
+          `
+          SELECT
+            id,
+            user_id,
+            type,
+            network,
+            amount,
+            address,
+            tx_hash,
+            status,
+            fee,
+            created_at,
+            updated_at
+
+          FROM
+            wallet_transactions
+
+          WHERE
+            (type='deposit' AND status IN ('pending','review'))
+            OR (type='withdraw' AND status='pending')
+
+          ORDER BY
+            created_at DESC
+          `
+        );
+
       res.json({
+        total_volume: Number(totals.total_volume || 0),
+        pending_deposits_count: Number(totals.pending_deposits_count || 0),
+        pending_withdrawals_count: Number(totals.pending_withdrawals_count || 0),
         transactions:
-          result.rows
+          result.rows,
+        pending_transactions:
+          pendingResult.rows
       });
 
     } catch {
@@ -5262,13 +5318,6 @@ function tierAmountForRank(tiers, rank) {
 // Leaderboard = most WINS in settled FREE matches (stake=0) within the week.
 async function getLeaderboardForPeriod(periodStr, limit) {
   const { start, end } = weekBounds(periodStr);
-  // TOURNAMENT_MIN_MATCH_SECONDS: a real 1v1 game cannot be over in a few
-  // seconds. Two accounts can otherwise farm the free-play leaderboard by
-  // starting a match and having one side immediately quit/forfeit, over
-  // and over -- which is how a player racks up several "wins" in under a
-  // minute. Matches that settle faster than this simply don't count
-  // toward tournament standings (they still settle normally in every
-  // other respect).
   const result = await db.query(`
     SELECT u.id, u.email, x.wins
     FROM (
@@ -5277,14 +5326,13 @@ async function getLeaderboardForPeriod(periodStr, limit) {
       WHERE status='settled' AND stake=0
         AND winner_user_id IS NOT NULL
         AND settled_at >= $1 AND settled_at < $2
-        AND settled_at >= created_at + ($4 || ' seconds')::interval
       GROUP BY winner_user_id
     ) x
     JOIN users u ON u.id = x.user_id
     WHERE COALESCE(u.banned, false) = false
     ORDER BY x.wins DESC, u.id ASC
     LIMIT $3
-  `, [start, end, limit || 50, String(TOURNAMENT_MIN_MATCH_SECONDS)]);
+  `, [start, end, limit || 50]);
   return result.rows;
 }
 
@@ -7031,6 +7079,13 @@ app.get('/api/admin/users', adminOnly, async (req, res) => {
                OR COALESCE(u.phone,'') ILIKE $1`;
     }
 
+    const totalCountResult = await db.query(`
+      SELECT COUNT(*)::int AS n
+      FROM users u
+      ${where}
+    `, params);
+    const totalCount = totalCountResult.rows[0] ? Number(totalCountResult.rows[0].n) : 0;
+
     const result = await db.query(`
       SELECT
         u.id, u.username, u.email, u.phone,
@@ -7054,7 +7109,9 @@ app.get('/api/admin/users', adminOnly, async (req, res) => {
       LIMIT 500
     `, params);
 
-    res.json({ users: result.rows.map(u => ({
+    res.json({
+      total_count: totalCount,
+      users: result.rows.map(u => ({
       ...u,
       balance: Number(u.balance || 0),
       wallet_locked: Number(u.wallet_locked || 0),
@@ -7284,6 +7341,15 @@ app.get(
   adminOnly,
   async (_req, res) => {
     try {
+      const totalCountResult =
+        await db.query(
+          `SELECT COUNT(*)::int AS n FROM paid_matches`
+        );
+      const totalCount =
+        totalCountResult.rows[0]
+          ? Number(totalCountResult.rows[0].n)
+          : 0;
+
       const result =
         await db.query(
           `
@@ -7306,6 +7372,7 @@ app.get(
         );
 
       res.json({
+        total_count: totalCount,
         matches:
           result.rows
       });
