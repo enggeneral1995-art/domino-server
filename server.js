@@ -5474,25 +5474,32 @@ async function getDisplayLeaderboard(periodStr, limit, tiers) {
     getLeaderboardForPeriod(periodStr, Math.max(limit || 50, 200)),
     getFakeLeaderboardEntries()
   ]);
-  const combined = [
-    ...real.map((r, i) => ({
-      user_id: r.id,
-      email: r.email,
-      wins: Number(r.wins),
-      fake: false,
-      real_rank: i + 1, // rank among REAL competitors only — this is what actually gets paid
-      prize_amount: tierAmountForRank(tiers, i + 1)
-    })),
-    ...fake.map(f => ({
-      user_id: null,
-      fake_id: f.id,
-      display_name: f.display_name,
-      wins: f.wins,
-      fake: true,
-      real_rank: null,
-      prize_amount: 0
-    }))
-  ];
+  const realRows = real.map((r, i) => ({
+    user_id: r.id,
+    email: r.email,
+    wins: Number(r.wins),
+    fake: false,
+    real_rank: i + 1, // rank among REAL competitors only — this is what actually gets paid
+    prize_amount: tierAmountForRank(tiers, i + 1)
+  }));
+  // Every real winner is always shown, full stop -- a real free-play win
+  // must never be invisible just because the operator's cosmetic seeded
+  // (fake) rows have bigger, always-climbing numbers. Fake rows only fill
+  // whatever room is left after all real rows, so a real player with a
+  // handful of wins can no longer be silently crowded off a leaderboard
+  // that looks -- correctly, per the fraud-check tool -- like it's
+  // crediting them, while the page they'd actually check never shows them.
+  const fakeSlots = Math.max(0, (limit || 50) - realRows.length);
+  const fakeRows = fake.slice(0, fakeSlots).map(f => ({
+    user_id: null,
+    fake_id: f.id,
+    display_name: f.display_name,
+    wins: f.wins,
+    fake: true,
+    real_rank: null,
+    prize_amount: 0
+  }));
+  const combined = [...realRows, ...fakeRows];
   combined.sort((a, b) => b.wins - a.wins);
   // "rank" here is just the visual position in the mixed list (for display
   // order only) — real_rank is the one real users should ever see next to
@@ -9969,6 +9976,52 @@ io.on(
     /* =====================================================
        NEXT ROUND
     ===================================================== */
+
+    // Round-end scoring needs the true pip total of BOTH hands, but each
+    // client only ever really knows its own -- the opponent's unplayed
+    // tiles are legitimately hidden from it, the same as in a real game.
+    // Both clients were each privately guessing the other's hand total
+    // from local placeholder tiles, so the two sides could show different,
+    // both-often-wrong point counts for the exact same round even though
+    // they still agreed on who won. The server already tracks both real
+    // hands (that's what move/draw legality checks use), so it can just
+    // answer the question directly instead of either side guessing.
+    socket.on(
+      'get_hand_totals',
+      (payload, ack) => {
+        try {
+          const roomId = socketRoom.get(socket.id);
+          const room = roomId ? rooms.get(roomId) : null;
+          if (!room || !Array.isArray(room.players)) {
+            if (typeof ack === 'function') ack({ ok: false });
+            return;
+          }
+          const seat = room.players.indexOf(socket.id);
+          if (seat < 0) {
+            if (typeof ack === 'function') ack({ ok: false });
+            return;
+          }
+          const opp = seat === 0 ? 1 : 0;
+          const pipSum = hand => (hand || []).reduce((s, v) => {
+            const t = TILE_VALUES[v];
+            return s + (t ? t[0] + t[1] : 0);
+          }, 0);
+          const myHand = (room.hands && room.hands[seat]) || [];
+          const oppHand = (room.hands && room.hands[opp]) || [];
+          if (typeof ack === 'function') {
+            ack({
+              ok: true,
+              mine: pipSum(myHand),
+              opponent: pipSum(oppHand),
+              myCount: myHand.length,
+              opponentCount: oppHand.length
+            });
+          }
+        } catch (e) {
+          if (typeof ack === 'function') ack({ ok: false });
+        }
+      }
+    );
 
     socket.on(
       'next_round',
