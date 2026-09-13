@@ -8612,6 +8612,12 @@ function applyCanonicalMove(room, seat, value, requestedSide, requestedRotation,
 
 function performServerAutoTurn(room, seat) {
   if (!room || room.turnSeat !== seat || !room.hands || !room.hands[seat]) return;
+  // A seat with no tiles has just gone out -- the round is over and the
+  // clients are about to ask for the next deal. Acting here would look for
+  // a legal tile, find none, and then pour the ENTIRE boneyard into an
+  // empty hand before passing. Never auto-play for a finished hand.
+  if (room.hands[seat].length === 0) return;
+  if (room.hands[seat === 0 ? 1 : 0] && room.hands[seat === 0 ? 1 : 0].length === 0) return;
   const actions = [];
   let hand = room.hands[seat];
   let value = hand.find(v => derivePlacement(room, v, null));
@@ -8653,6 +8659,13 @@ const SERVER_AUTO_TURN_MS = 13000;
 
 function armRoomTurnTimer(room) {
   if (!room || room.turnSeat == null) return;
+  // Same reasoning as performServerAutoTurn: once either hand is empty the
+  // round is finished. Leave the timer off until the next deal arms it.
+  if (room.hands && ((room.hands[0] && room.hands[0].length === 0) ||
+                     (room.hands[1] && room.hands[1].length === 0))) {
+    clearRoomTurnTimer(room);
+    return;
+  }
   clearRoomTurnTimer(room);
   const serial = room.roundSerial;
   const expectedSeat = room.turnSeat;
