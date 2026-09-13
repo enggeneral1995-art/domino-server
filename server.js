@@ -8509,67 +8509,9 @@ function boardChainFor(room) {
   return chain;
 }
 
-// RESTORED (fix-pvp-sync-1): the client (build fix-20260911l and later)
-// DOES listen for 'game_state' and depends on it to correct its turn, its
-// hand and its board. Removing these sends is what left every person-vs-
-// person match with no way to repair itself after a single lost message.
-//
-// If a false "leftEnd/rightEnd mismatch" ever shows up in the client's
-// console and causes repeated rebuilds, flip this one flag to false: the
-// client skips those two checks when the fields are absent, and the board
-// and hand counts still catch every real divergence.
-const SEND_BOARD_ENDS = true;
-
-function nextStateSerial(room) {
-  room.stateSerial = (room.stateSerial || 0) + 1;
-  return room.stateSerial;
-}
-
-function stateForSeat(room, seat, serial) {
-  if (!room || !room.hands || !room.hands[seat]) return null;
-  const oppSeat = seat === 0 ? 1 : 0;
-  const state = {
-    stateSerial: (serial != null ? serial : nextStateSerial(room)),
-    roundSerial: room.roundSerial || 0,
-    seat: seat,
-    turnSeat: room.turnSeat,
-    // Full detail for this seat only. The opponent gets a count, never
-    // their tiles -- the state can be sent freely without leaking a hand.
-    yourHand: (room.hands[seat] || []).slice(),
-    oppHandCount: (room.hands[oppSeat] || []).length,
-    board: boardChainFor(room),
-    boneyardCount: room.boneyard ? room.boneyard.length : 0,
-    goal: room.goal,
-    match_id: room.matchId || null
-  };
-  if (SEND_BOARD_ENDS) {
-    state.leftEnd = room.leftEnd;
-    state.rightEnd = room.rightEnd;
-  }
-  return state;
-}
-
-function broadcastState(room) {
-  if (!room || !room.players || !room.hands) return;
-  const serial = nextStateSerial(room);
-  for (let seat = 0; seat < 2; seat++) {
-    const sid = room.players[seat];
-    if (!sid) continue;
-    const state = stateForSeat(room, seat, serial);
-    if (state) io.to(sid).emit('game_state', state);
-  }
-}
-
-// A round is blocked ("qapat") when the boneyard is empty and neither
-// player holds a tile that fits either end. Without this the turn timer
-// just auto-passed back and forth every 13s forever -- the freeze the
-// players saw, with the turn flipping in the log and nothing happening.
-function isRoundBlocked(room) {
-  if (!room || !room.hands) return false;
-  if (room.boneyard && room.boneyard.length) return false;
-  if (room.leftEnd == null || room.rightEnd == null) return false;
-  return !hasLegalMove(room, 0) && !hasLegalMove(room, 1);
-}
+// stateForSeat/broadcastState removed along with resume_match/game_state --
+// see /areas/yalla-domino.md. The client no longer listens for game_state,
+// so these would only have been dead sends.
 
 function hasLegalMove(room, seat) {
   const hand = room && room.hands && room.hands[seat];
@@ -8612,7 +8554,6 @@ function applyCanonicalMove(room, seat, value, requestedSide, requestedRotation,
   const placement = derivePlacement(room, value, requestedSide);
   if (!placement) return { ok:false, error:'illegal_placement' };
   hand.splice(idx,1);
-  room.consecutivePasses = 0;
   room.leftEnd = placement.newLeft;
   room.rightEnd = placement.newRight;
   room.moves = (room.moves || 0) + 1;
@@ -8624,12 +8565,6 @@ function applyCanonicalMove(room, seat, value, requestedSide, requestedRotation,
 
 function performServerAutoTurn(room, seat) {
   if (!room || room.turnSeat !== seat || !room.hands || !room.hands[seat]) return;
-  // A seat with no tiles has just gone out -- the round is over and the
-  // clients are about to ask for the next deal. Acting here would look for
-  // a legal tile, find none, and then pour the ENTIRE boneyard into an
-  // empty hand before passing. Never auto-play for a finished hand.
-  if (room.hands[seat].length === 0) return;
-  if (room.hands[seat === 0 ? 1 : 0] && room.hands[seat === 0 ? 1 : 0].length === 0) return;
   const actions = [];
   let hand = room.hands[seat];
   let value = hand.find(v => derivePlacement(room, v, null));
@@ -8652,12 +8587,10 @@ function performServerAutoTurn(room, seat) {
     actions.push({ type:'pass', seat });
     room.lastActivityAt = Date.now();
     room.turnSeat = seat === 0 ? 1 : 0;
-    room.consecutivePasses = (room.consecutivePasses || 0) + 1;
   }
   for (const sid of (room.players || [])) {
     if (sid) io.to(sid).emit('server_auto_actions', { roundSerial: room.roundSerial, seat, actions, turnSeat: room.turnSeat });
   }
-  broadcastState(room);
   armRoomTurnTimer(room);
 }
 
@@ -8666,35 +8599,16 @@ function clearRoomTurnTimer(room) {
   if (room && room._turnFailTimer) { clearTimeout(room._turnFailTimer); room._turnFailTimer = null; }
 }
 
-// The client auto-plays at exactly 10000ms. Keep the server strictly
-// later so the two can never fire for the same turn.
-const SERVER_AUTO_TURN_MS = 13000;
-
 function armRoomTurnTimer(room) {
   if (!room || room.turnSeat == null) return;
-  // Same reasoning as performServerAutoTurn: once either hand is empty the
-  // round is finished. Leave the timer off until the next deal arms it.
-  if (room.hands && ((room.hands[0] && room.hands[0].length === 0) ||
-                     (room.hands[1] && room.hands[1].length === 0))) {
-    clearRoomTurnTimer(room);
-    return;
-  }
-  // Blocked round: both seats have now passed, so both clients have marked
-  // each other locked and are scoring the round. Re-arming here is what
-  // produced the endless OURS/THEIRS ping-pong.
-  if ((room.consecutivePasses || 0) >= 2 && isRoundBlocked(room)) {
-    clearRoomTurnTimer(room);
-    console.log('[round] blocked (qapat) roomId=' + room.id + ' -- turn timer stopped');
-    return;
-  }
   clearRoomTurnTimer(room);
   const serial = room.roundSerial;
   const expectedSeat = room.turnSeat;
-  room.turnDeadline = Date.now() + SERVER_AUTO_TURN_MS;
+  room.turnDeadline = Date.now() + 10000;
   room._turnTimer = setTimeout(() => {
     if (!room || room.roundSerial !== serial || room.turnSeat !== expectedSeat) return;
     performServerAutoTurn(room, expectedSeat);
-  }, SERVER_AUTO_TURN_MS);
+  }, 10000);
 }
 
 function startRound(room) {
@@ -8728,7 +8642,6 @@ function startRound(room) {
   room.processedDrawNonces = [new Map(), new Map()];
   room.leftEnd = null;
   room.rightEnd = null;
-  room.consecutivePasses = 0;
   room.turnDeadline = Date.now() + 10000;
 
   // Ordered log of every board move/pass/draw this round, used to replay
@@ -8751,9 +8664,6 @@ function startRound(room) {
 
       starterSeat:
         round.starterSeat,
-
-      roundSerial:
-        room.roundSerial,
 
       boneyardCount:
         room.boneyard.length,
@@ -8787,9 +8697,6 @@ function startRound(room) {
 
       starterSeat:
         round.starterSeat,
-
-      roundSerial:
-        room.roundSerial,
 
       boneyardCount:
         room.boneyard.length,
@@ -9484,8 +9391,6 @@ io.on(
             }
           );
         }
-
-        broadcastState(room);
       }
     );
 
@@ -9815,7 +9720,6 @@ io.on(
           if (room.log) room.log.push({ type:'pass', seat, nonce });
           room.lastActivityAt = Date.now();
           room.turnSeat = seat === 0 ? 1 : 0;
-          room.consecutivePasses = (room.consecutivePasses || 0) + 1;
         }
         if (nonce) {
           moveNonceMap.set(nonce, { ok: true });
@@ -9866,70 +9770,9 @@ io.on(
         }
         deliverToOpponent(1);
 
-        // The incremental 'game_move' above is an optimisation; THIS is the
-        // truth. A phone that missed the increment is put right by it.
-        broadcastState(room);
-
         if (typeof ack === 'function') ack({ ok: true });
       }
     );
-
-    /* =====================================================
-       AUTHORITATIVE STATE ON DEMAND
-
-       The client asks for this every 4 seconds while a match is running,
-       and again immediately after any rejected move. Both requests used
-       to hit a server with no handler for them, so the phone sat waiting
-       for a correction that was never coming -- which is exactly what a
-       frozen match looks like to the player.
-    ===================================================== */
-
-    socket.on('request_game_state', () => {
-      try {
-        const roomId = socketRoom.get(socket.id);
-        if (!roomId) return;
-        const room = rooms.get(roomId);
-        if (!room || !room.hands || !room.players) return;
-        const seat = room.players[0] === socket.id ? 0 : 1;
-        const state = stateForSeat(room, seat);
-        if (state) socket.emit('game_state', state);
-      } catch (e) {
-        console.error('[request_game_state] ' + e.message);
-      }
-    });
-
-    socket.on('request_board_sync', () => {
-      try {
-        const roomId = socketRoom.get(socket.id);
-        if (!roomId) {
-          socket.emit('board_sync_result', { ok: false });
-          return;
-        }
-        const room = rooms.get(roomId);
-        if (!room || !room.hands || !room.players) {
-          socket.emit('board_sync_result', { ok: false });
-          return;
-        }
-        const seat = room.players[0] === socket.id ? 0 : 1;
-        socket.emit('board_sync_result', {
-          ok: true,
-          seat: seat,
-          turnSeat: room.turnSeat,
-          roundSerial: room.roundSerial || 0,
-          log: (room.log || []).slice(),
-          yourHand: (room.hands[seat] || []).slice(),
-          oppHandCount: (room.hands[seat === 0 ? 1 : 0] || []).length,
-          boneyardCount: room.boneyard ? room.boneyard.length : 0
-        });
-        // Whatever prompted the diagnostic, the phone is better off with
-        // the full position too.
-        const state = stateForSeat(room, seat);
-        if (state) socket.emit('game_state', state);
-      } catch (e) {
-        console.error('[request_board_sync] ' + e.message);
-        try { socket.emit('board_sync_result', { ok: false }); } catch (e2) {}
-      }
-    });
 
     /* =====================================================
        REPORT PAID RESULT
