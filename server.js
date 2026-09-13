@@ -8560,6 +8560,17 @@ function broadcastState(room) {
   }
 }
 
+// A round is blocked ("qapat") when the boneyard is empty and neither
+// player holds a tile that fits either end. Without this the turn timer
+// just auto-passed back and forth every 13s forever -- the freeze the
+// players saw, with the turn flipping in the log and nothing happening.
+function isRoundBlocked(room) {
+  if (!room || !room.hands) return false;
+  if (room.boneyard && room.boneyard.length) return false;
+  if (room.leftEnd == null || room.rightEnd == null) return false;
+  return !hasLegalMove(room, 0) && !hasLegalMove(room, 1);
+}
+
 function hasLegalMove(room, seat) {
   const hand = room && room.hands && room.hands[seat];
   if (!hand) return false;
@@ -8601,6 +8612,7 @@ function applyCanonicalMove(room, seat, value, requestedSide, requestedRotation,
   const placement = derivePlacement(room, value, requestedSide);
   if (!placement) return { ok:false, error:'illegal_placement' };
   hand.splice(idx,1);
+  room.consecutivePasses = 0;
   room.leftEnd = placement.newLeft;
   room.rightEnd = placement.newRight;
   room.moves = (room.moves || 0) + 1;
@@ -8640,6 +8652,7 @@ function performServerAutoTurn(room, seat) {
     actions.push({ type:'pass', seat });
     room.lastActivityAt = Date.now();
     room.turnSeat = seat === 0 ? 1 : 0;
+    room.consecutivePasses = (room.consecutivePasses || 0) + 1;
   }
   for (const sid of (room.players || [])) {
     if (sid) io.to(sid).emit('server_auto_actions', { roundSerial: room.roundSerial, seat, actions, turnSeat: room.turnSeat });
@@ -8664,6 +8677,14 @@ function armRoomTurnTimer(room) {
   if (room.hands && ((room.hands[0] && room.hands[0].length === 0) ||
                      (room.hands[1] && room.hands[1].length === 0))) {
     clearRoomTurnTimer(room);
+    return;
+  }
+  // Blocked round: both seats have now passed, so both clients have marked
+  // each other locked and are scoring the round. Re-arming here is what
+  // produced the endless OURS/THEIRS ping-pong.
+  if ((room.consecutivePasses || 0) >= 2 && isRoundBlocked(room)) {
+    clearRoomTurnTimer(room);
+    console.log('[round] blocked (qapat) roomId=' + room.id + ' -- turn timer stopped');
     return;
   }
   clearRoomTurnTimer(room);
@@ -8707,6 +8728,7 @@ function startRound(room) {
   room.processedDrawNonces = [new Map(), new Map()];
   room.leftEnd = null;
   room.rightEnd = null;
+  room.consecutivePasses = 0;
   room.turnDeadline = Date.now() + 10000;
 
   // Ordered log of every board move/pass/draw this round, used to replay
@@ -9793,6 +9815,7 @@ io.on(
           if (room.log) room.log.push({ type:'pass', seat, nonce });
           room.lastActivityAt = Date.now();
           room.turnSeat = seat === 0 ? 1 : 0;
+          room.consecutivePasses = (room.consecutivePasses || 0) + 1;
         }
         if (nonce) {
           moveNonceMap.set(nonce, { ok: true });
