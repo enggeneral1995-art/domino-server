@@ -9768,12 +9768,21 @@ io.on(
           room.lastActivityAt = Date.now();
           room.turnSeat = seat === 0 ? 1 : 0;
         }
+        const ackPayload = type === 'move'
+          ? { ok: true, side: acceptedMessage.side, rotation: acceptedMessage.rotation }
+          : { ok: true };
         if (nonce) {
-          moveNonceMap.set(nonce, { ok: true });
+          moveNonceMap.set(nonce, ackPayload);
           while (moveNonceMap.size > 64) moveNonceMap.delete(moveNonceMap.keys().next().value);
         }
         armRoomTurnTimer(room);
-        broadcastAuthoritativeState(room);
+
+        // Do NOT broadcast a full game_state here. The accepted game_move
+        // plus its ack are the ordered delivery path for this action. A full
+        // snapshot racing those messages can advance the sender's turn before
+        // it has locally applied its confirmed tile, or rebuild the opponent
+        // just before game_move arrives, causing a duplicate. Periodic/requested
+        // game_state remains the recovery path; rejections still push one now.
 
         const opponent =
           otherPlayer(
@@ -9782,7 +9791,7 @@ io.on(
           );
 
         if (!opponent) {
-          if (typeof ack === 'function') ack({ ok: true });
+          if (typeof ack === 'function') ack(ackPayload);
           return;
         }
 
@@ -9818,7 +9827,7 @@ io.on(
         }
         deliverToOpponent(1);
 
-        if (typeof ack === 'function') ack({ ok: true });
+        if (typeof ack === 'function') ack(ackPayload);
       }
     );
 
