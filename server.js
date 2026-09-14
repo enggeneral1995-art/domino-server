@@ -9739,7 +9739,6 @@ io.on(
 
         // Server-authoritative turn/order/tile/placement validation.
         if (room.turnSeat != null && room.turnSeat !== seat) {
-          broadcastAuthoritativeState(room);
           if (typeof ack === 'function') ack({ ok: false, error: 'not_your_turn' });
           return;
         }
@@ -9752,7 +9751,6 @@ io.on(
         if (type === 'move') {
           const result = applyCanonicalMove(room, seat, value, message && message.side, message && message.rotation, nonce);
           if (!result.ok) {
-            broadcastAuthoritativeState(room);
             if (typeof ack === 'function') ack({ ok:false, error:result.error });
             return;
           }
