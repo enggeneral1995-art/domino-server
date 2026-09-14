@@ -9661,6 +9661,31 @@ io.on(
       }
     );
 
+    // Push the canonical position to both seats after every authoritative
+    // change. This closes the window where one phone has already animated a
+    // move while the other phone is still working from an older turn/board.
+    function broadcastAuthoritativeState(room) {
+      if (!room || !Array.isArray(room.players)) return;
+      room._stateSerial = Number(room._stateSerial || 0) + 1;
+      for (let seat = 0; seat < 2; seat++) {
+        const sid = room.players[seat];
+        if (!sid) continue;
+        const opp = seat === 0 ? 1 : 0;
+        io.to(sid).emit('game_state', {
+          stateSerial: room._stateSerial,
+          roundSerial: room.roundSerial,
+          seat,
+          turnSeat: room.turnSeat,
+          yourHand: (room.hands && room.hands[seat] || []).slice(),
+          oppHandCount: (room.hands && room.hands[opp] || []).length,
+          boneyardCount: room.boneyard ? room.boneyard.length : 0,
+          leftEnd: room.leftEnd,
+          rightEnd: room.rightEnd,
+          board: boardChainFor(room)
+        });
+      }
+    }
+
     /* =====================================================
        GAME MOVE
     ===================================================== */
@@ -9714,6 +9739,7 @@ io.on(
 
         // Server-authoritative turn/order/tile/placement validation.
         if (room.turnSeat != null && room.turnSeat !== seat) {
+          broadcastAuthoritativeState(room);
           if (typeof ack === 'function') ack({ ok: false, error: 'not_your_turn' });
           return;
         }
@@ -9726,6 +9752,7 @@ io.on(
         if (type === 'move') {
           const result = applyCanonicalMove(room, seat, value, message && message.side, message && message.rotation, nonce);
           if (!result.ok) {
+            broadcastAuthoritativeState(room);
             if (typeof ack === 'function') ack({ ok:false, error:result.error });
             return;
           }
@@ -9746,6 +9773,7 @@ io.on(
           while (moveNonceMap.size > 64) moveNonceMap.delete(moveNonceMap.keys().next().value);
         }
         armRoomTurnTimer(room);
+        broadcastAuthoritativeState(room);
 
         const opponent =
           otherPlayer(
