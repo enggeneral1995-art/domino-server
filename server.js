@@ -10169,16 +10169,33 @@ io.on(
             // return the winner in that local orientation as well as the exact
             // point delta.  This prevents the two phones from independently
             // guessing hidden-hand values and drifting to different scores.
-            const winnerLocal = mine <= opponent ? 0 : 1;
+            const winnerSeat = mine <= opponent ? seat : opp;
+            const winnerLocal = winnerSeat === seat ? 0 : 1;
             const points = Math.abs(opponent - mine);
+
+            // SCORE-SYNC-FINAL: the room owns the cumulative score. Commit a
+            // round exactly once by roundSerial, no matter which phone asks
+            // first or how many retries arrive. Each phone receives the same
+            // authoritative totals, translated to its local player-0 view.
+            if (!Array.isArray(room.scores)) room.scores = [0, 0];
+            if (room._scoreCommittedRound !== room.roundSerial) {
+              room.scores[winnerSeat] += points;
+              room._scoreCommittedRound = room.roundSerial;
+              room._scoreCommit = { winnerSeat, points };
+              console.log('[score_sync] room=' + roomId + ' round=' + room.roundSerial +
+                ' winnerSeat=' + winnerSeat + ' points=' + points +
+                ' scores=' + room.scores[0] + '-' + room.scores[1]);
+            }
+            const committed = room._scoreCommit || { winnerSeat, points };
             ack({
               ok: true,
               mine,
               opponent,
               myCount: myHand.length,
               opponentCount: oppHand.length,
-              winnerLocal,
-              points,
+              winnerLocal: committed.winnerSeat === seat ? 0 : 1,
+              points: committed.points,
+              scores: [room.scores[seat] || 0, room.scores[opp] || 0],
               roundSerial: room.roundSerial || 0
             });
           }
