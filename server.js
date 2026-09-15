@@ -10182,13 +10182,52 @@ io.on(
             // first or how many retries arrive. Each phone receives the same
             // authoritative totals, translated to its local player-0 view.
             if (!Array.isArray(room.scores)) room.scores = [0, 0];
-            if (room._scoreCommittedRound !== room.roundSerial) {
+
+            // A round only has a score once it is actually finished.
+            //
+            // Without this, a phone that asks late -- after the other one
+            // has already triggered the next deal -- finds a new
+            // roundSerial, passes the commit-once check a second time, and
+            // scores the freshly dealt hands as though they were the end of
+            // a round.
+            const roundOver =
+              myHand.length === 0 ||
+              oppHand.length === 0 ||
+              ((room.boneyard || []).length === 0 &&
+               !hasLegalMove(room, seat) &&
+               !hasLegalMove(room, opp));
+
+            if (roundOver && room._scoreCommittedRound !== room.roundSerial) {
               room.scores[winnerSeat] += points;
               room._scoreCommittedRound = room.roundSerial;
               room._scoreCommit = { winnerSeat, points };
               console.log('[score_sync] room=' + roomId + ' round=' + room.roundSerial +
                 ' winnerSeat=' + winnerSeat + ' points=' + points +
                 ' scores=' + room.scores[0] + '-' + room.scores[1]);
+
+              // PUSH the new total to BOTH seats; do not wait to be asked.
+              //
+              // Scoring used to happen only in the reply to whoever called
+              // get_hand_totals, and on a blocked round a phone only calls it
+              // once it has decided for itself that both players are locked.
+              // The two phones do not always reach that conclusion -- one
+              // registers the opponent's final pass a moment later, or not at
+              // all -- so one phone asked, scored, and moved on while the
+              // other never asked and never learned the round had a score.
+              // That is the 6 on one screen and 0 on the other.
+              //
+              // The room owns the score, so the room tells both seats.
+              for (let s2 = 0; s2 < 2; s2++) {
+                const sid2 = room.players[s2];
+                if (!sid2) continue;
+                const o2 = s2 === 0 ? 1 : 0;
+                io.to(sid2).emit('round_score', {
+                  roundSerial: room.roundSerial,
+                  scores: [room.scores[s2] || 0, room.scores[o2] || 0],
+                  winnerLocal: winnerSeat === s2 ? 0 : 1,
+                  points
+                });
+              }
             }
             const committed = room._scoreCommit || { winnerSeat, points };
             ack({
