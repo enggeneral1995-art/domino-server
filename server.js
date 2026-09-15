@@ -1766,6 +1766,67 @@ app.get('/api/global-chat/history', async (req, res) => {
 });
 
 /* =========================================================
+   ADMIN — GLOBAL CHAT MANAGEMENT
+   Admin panel can review recent public-chat messages and
+   delete a selected message. Deletion is broadcast live so
+   it disappears immediately for everyone currently online.
+========================================================= */
+
+app.get('/api/admin/global-chat/messages', adminOnly, async (_req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT id, user_id, name, text, created_at
+      FROM global_chat_messages
+      WHERE deleted = false
+      ORDER BY created_at DESC
+      LIMIT 300
+    `);
+
+    res.json({
+      messages: result.rows.map(row => ({
+        id: row.id,
+        userId: row.user_id,
+        name: row.name,
+        text: row.text,
+        ts: new Date(row.created_at).getTime()
+      }))
+    });
+  } catch (e) {
+    console.error('admin global-chat list error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/global-chat/:id/delete', adminOnly, async (req, res) => {
+  try {
+    const messageId = Number(req.params.id);
+    if (!Number.isInteger(messageId)) {
+      return res.status(400).json({ error: 'valid_message_id_required' });
+    }
+
+    const updated = await db.query(
+      `UPDATE global_chat_messages
+       SET deleted=true
+       WHERE id=$1 AND deleted=false
+       RETURNING id`,
+      [messageId]
+    );
+
+    if (!updated.rows.length) {
+      return res.status(404).json({ error: 'message_not_found' });
+    }
+
+    // Existing clients already listen for this event.
+    io.emit('global_chat_message_deleted', { id: messageId });
+    res.json({ ok: true, id: messageId });
+  } catch (e) {
+    console.error('admin global-chat delete error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+
+/* =========================================================
    TELEGRAM JOIN BONUS (simple version — no bot required)
    Person taps the banner -> opens the channel link -> app credits
    the one-time bonus right away. No membership verification, so
