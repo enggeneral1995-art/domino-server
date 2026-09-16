@@ -1945,6 +1945,99 @@ app.delete('/api/friends/:id', auth, async (req,res) => {
 });
 
 /* =========================================================
+   FRIEND SYSTEM — PHASE 2
+   Presence + private 1:1 friend chat. Deliberately isolated from all
+   domino rooms, turns, scoring, matchmaking and wallet code.
+========================================================= */
+const friendPresence = new Map(); // userId -> last heartbeat ms
+
+async function initFriendChatTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS friend_messages (
+      id BIGSERIAL PRIMARY KEY,
+      sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_pair_idx ON friend_messages(sender_id, recipient_id, id DESC)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_recipient_idx ON friend_messages(recipient_id, id DESC)`);
+}
+
+async function areAcceptedFriends(a,b) {
+  const [lo,hi]=friendPair(a,b);
+  const r=await db.query(`SELECT 1 FROM friendships WHERE user_low=$1 AND user_high=$2 AND status='accepted' LIMIT 1`,[lo,hi]);
+  return !!r.rows.length;
+}
+
+app.post('/api/friends/presence', auth, async (req,res) => {
+  friendPresence.set(Number(req.user.id), Date.now());
+  res.json({ok:true});
+});
+
+app.get('/api/friends/presence', auth, async (req,res) => {
+  try {
+    const uid=Number(req.user.id), now=Date.now();
+    friendPresence.set(uid, now);
+    const r=await db.query(`SELECT CASE WHEN user_low=$1 THEN user_high ELSE user_low END AS id FROM friendships WHERE (user_low=$1 OR user_high=$1) AND status='accepted'`,[uid]);
+    const online={};
+    for(const row of r.rows){ const id=Number(row.id); online[id]=(now-(friendPresence.get(id)||0)) < 65000; }
+    res.json({online});
+  } catch(e){ console.error('friend presence error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.get('/api/friends/:userId/messages', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    const after=Math.max(0,Number(req.query.after)||0);
+    const r=await db.query(`
+      SELECT id, sender_id, recipient_id, text, created_at
+      FROM friend_messages
+      WHERE ((sender_id=$1 AND recipient_id=$2) OR (sender_id=$2 AND recipient_id=$1))
+        AND id > $3
+      ORDER BY id ASC LIMIT 100
+    `,[me,other,after]);
+    res.json({messages:r.rows.map(x=>({id:Number(x.id),sender_id:Number(x.sender_id),recipient_id:Number(x.recipient_id),text:x.text,ts:new Date(x.created_at).getTime()}))});
+  } catch(e){ console.error('friend messages error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:userId/messages', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    const text=censorText(String(req.body?.text||'').slice(0,500).trim());
+    if(!text) return res.status(400).json({error:'empty_message'});
+    const r=await db.query(`INSERT INTO friend_messages(sender_id,recipient_id,text) VALUES($1,$2,$3) RETURNING id,created_at`,[me,other,text]);
+    friendPresence.set(me,Date.now());
+    res.json({ok:true,message:{id:Number(r.rows[0].id),sender_id:me,recipient_id:other,text,ts:new Date(r.rows[0].created_at).getTime()}});
+  } catch(e){ console.error('friend send message error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+/* Admin moderation — private friend chat review. Read-only by design. */
+app.get('/api/admin/friend-chat/messages', adminOnly, async (req,res) => {
+  try {
+    const limit=Math.min(500,Math.max(1,Number(req.query.limit)||300));
+    const r=await db.query(`
+      SELECT m.id, m.sender_id, m.recipient_id, m.text, m.created_at,
+             COALESCE(s.username, 'Player ' || m.sender_id::text) AS sender_name,
+             COALESCE(rc.username, 'Player ' || m.recipient_id::text) AS recipient_name
+      FROM friend_messages m
+      LEFT JOIN users s ON s.id=m.sender_id
+      LEFT JOIN users rc ON rc.id=m.recipient_id
+      ORDER BY m.id DESC
+      LIMIT $1
+    `,[limit]);
+    res.json({messages:r.rows.map(x=>({
+      id:Number(x.id), senderId:Number(x.sender_id), recipientId:Number(x.recipient_id),
+      senderName:x.sender_name, recipientName:x.recipient_name, text:x.text,
+      ts:new Date(x.created_at).getTime()
+    }))});
+  } catch(e){ console.error('admin friend chat error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+/* =========================================================
    TELEGRAM JOIN BONUS (simple version — no bot required)
    Person taps the banner -> opens the channel link -> app credits
    the one-time bonus right away. No membership verification, so
@@ -10611,6 +10704,7 @@ async function startServer() {
     await initGlobalChatTable();
 
     await initFriendTables();
+    await initFriendChatTable();
 
     await initTelegramJoinTable();
 
