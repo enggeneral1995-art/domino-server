@@ -9239,6 +9239,11 @@ io.on(
                 );
 
           const playerInfo = {
+            // Public account id is included only so the matched opponent can
+            // send a friend request from the in-match UI. It does not touch
+            // room/turn/score/wallet state.
+            id: Number(userId),
+
             name:
               String(
                 options.name ||
