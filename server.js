@@ -907,7 +907,8 @@ async function initAdminUserTools() {
       balance_before NUMERIC(20,8) NOT NULL,
       balance_after NUMERIC(20,8) NOT NULL,
       reason TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      read_at TIMESTAMPTZ
     )
   `);
 
@@ -1961,6 +1962,7 @@ async function initFriendChatTable() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+  await db.query(`ALTER TABLE friend_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`);
   await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_pair_idx ON friend_messages(sender_id, recipient_id, id DESC)`);
   await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_recipient_idx ON friend_messages(recipient_id, id DESC)`);
 }
@@ -1985,6 +1987,30 @@ app.get('/api/friends/presence', auth, async (req,res) => {
     for(const row of r.rows){ const id=Number(row.id); online[id]=(now-(friendPresence.get(id)||0)) < 65000; }
     res.json({online});
   } catch(e){ console.error('friend presence error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.get('/api/friends/unread', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id);
+    const r=await db.query(`
+      SELECT sender_id AS id, COUNT(*)::int AS count, MAX(created_at) AS last_at
+      FROM friend_messages
+      WHERE recipient_id=$1 AND read_at IS NULL
+      GROUP BY sender_id
+    `,[me]);
+    const unread={};
+    for(const x of r.rows) unread[Number(x.id)]={count:Number(x.count)||0,lastTs:new Date(x.last_at).getTime()};
+    res.json({unread});
+  } catch(e){ console.error('friend unread error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:userId/read', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    await db.query(`UPDATE friend_messages SET read_at=NOW() WHERE sender_id=$1 AND recipient_id=$2 AND read_at IS NULL`,[other,me]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend read error:',e.message); res.status(500).json({error:'server_error'}); }
 });
 
 app.get('/api/friends/:userId/messages', auth, async (req,res) => {
