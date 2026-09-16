@@ -753,7 +753,45 @@ function publicUser(user) {
   };
 }
 
-function auth(
+// Is this account banned right now?
+//
+// A JWT is signed once and then believed until it expires, so a ban had no
+// effect on anyone already holding a token: they could still chat, add
+// friends and start matches. The token cannot be un-issued, so the answer
+// has to come from the database -- cached briefly, because otherwise every
+// single request would pay for a query.
+const bannedCache = new Map(); // userId -> { banned, at }
+const BANNED_CACHE_MS = 30 * 1000;
+
+function forgetBanState(userId) {
+  bannedCache.delete(Number(userId));
+}
+
+async function isUserBanned(userId) {
+  const id = Number(userId);
+  if (!Number.isInteger(id)) return false;
+  const hit = bannedCache.get(id);
+  const now = Date.now();
+  if (hit && now - hit.at < BANNED_CACHE_MS) return hit.banned;
+  try {
+    const r = await db.query('SELECT banned FROM users WHERE id=$1', [id]);
+    const banned = !!(r.rows.length && r.rows[0].banned);
+    bannedCache.set(id, { banned, at: now });
+    return banned;
+  } catch (e) {
+    // Fail open. A database wobble must not lock every player out.
+    console.error('ban state check failed:', e.message);
+    return false;
+  }
+}
+
+const bannedCacheSweeper = setInterval(() => {
+  const cutoff = Date.now() - BANNED_CACHE_MS;
+  for (const [id, v] of bannedCache.entries()) if (v.at < cutoff) bannedCache.delete(id);
+}, 5 * 60 * 1000);
+if (bannedCacheSweeper.unref) bannedCacheSweeper.unref();
+
+async function auth(
   req,
   res,
   next
@@ -784,6 +822,17 @@ function auth(
         token,
         JWT_SECRET
       );
+
+    // The signature being valid is not the same as the account being
+    // allowed. Check the ban before letting the request through.
+    if (await isUserBanned(req.user?.id)) {
+      return res
+        .status(403)
+        .json({
+          error:
+            'account_banned'
+        });
+    }
 
     next();
 
@@ -952,6 +1001,16 @@ app.post(
       } =
         req.body || {};
 
+      // A banned handset may not open a fresh account. This is the whole
+      // point of the feature: the account ban is trivially sidestepped by
+      // signing up again on the same phone.
+      const regDevice = cleanDeviceId(req.body?.device_id);
+      const regFingerprint = cleanFingerprint(req.body?.fingerprint);
+      if (await isDeviceBanned(regDevice)) {
+        console.log('[device_ban] register blocked device=' + regDevice);
+        return res.status(403).json({ error: 'device_banned' });
+      }
+
       if (
         !email ||
         !password
@@ -1045,6 +1104,7 @@ app.post(
         result.rows[0];
 
       await updateUserLocation(user.id, req);
+      await rememberDevice(user.id, regDevice, regFingerprint);
 
       const refreshed =
         await db.query(
@@ -1078,6 +1138,93 @@ app.post(
     }
   }
 );
+
+/* =========================================================
+   DEVICE BANS
+
+   A ban on an account stops that account. It does nothing about the
+   person, who simply signs up again on the same phone a minute later.
+   This ties bans to the handset as well.
+
+   What this can and cannot do, plainly:
+
+     - It CAN stop the ordinary case: someone banned, opening the app on
+       the same phone, making a new account. That is what actually
+       happens.
+     - It CANNOT be absolute. A browser has no true device identity. Wipe
+       the site data, use a private window, or switch browser and the
+       marker is gone. Anyone claiming otherwise about a web app is
+       guessing.
+
+   So the marker is stored twice -- localStorage and a long-lived cookie --
+   because people clear one far more often than both, and a fingerprint is
+   recorded alongside it for an admin to look at. The fingerprint is NOT
+   used to block automatically: two identical phone models in the same
+   city produce the same fingerprint, and banning a stranger by accident
+   is worse than missing one evader.
+========================================================= */
+
+async function ensureDeviceTables() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS device_bans (
+      device_id   TEXT PRIMARY KEY,
+      reason      TEXT,
+      banned_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      source_user BIGINT
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS user_devices (
+      user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      device_id   TEXT NOT NULL,
+      fingerprint TEXT,
+      first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, device_id)
+    )
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS user_devices_device_idx ON user_devices(device_id)`);
+}
+ensureDeviceTables().catch(e => console.error('device tables error:', e.message));
+
+// Accept only something we issued: 32 hex characters. Anything else is
+// treated as "no device", never as a value to store.
+function cleanDeviceId(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return /^[a-f0-9]{32}$/.test(s) ? s : null;
+}
+
+function cleanFingerprint(v) {
+  const s = String(v || '').trim();
+  return s ? s.slice(0, 120) : null;
+}
+
+async function isDeviceBanned(deviceId) {
+  if (!deviceId) return false;
+  try {
+    const r = await db.query('SELECT 1 FROM device_bans WHERE device_id=$1 LIMIT 1', [deviceId]);
+    return !!r.rows.length;
+  } catch (e) {
+    // Fail open: a database hiccup must not lock out the whole player base.
+    console.error('device ban check failed:', e.message);
+    return false;
+  }
+}
+
+async function rememberDevice(userId, deviceId, fingerprint) {
+  if (!userId || !deviceId) return;
+  try {
+    await db.query(`
+      INSERT INTO user_devices(user_id, device_id, fingerprint)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, device_id)
+      DO UPDATE SET last_seen = NOW(),
+                    fingerprint = COALESCE(EXCLUDED.fingerprint, user_devices.fingerprint)
+    `, [userId, deviceId, fingerprint]);
+  } catch (e) {
+    console.error('remember device failed:', e.message);
+  }
+}
 
 /* =========================================================
    LOGIN
@@ -1183,6 +1330,18 @@ app.post(
       }
 
       if (user.banned) {
+        // Sign-in by a banned account also marks the handset, so the next
+        // move -- opening a fresh account on this phone -- is already shut.
+        const tryDevice = cleanDeviceId(req.body?.device_id);
+        if (tryDevice) {
+          try {
+            await db.query(`
+              INSERT INTO device_bans(device_id, reason, source_user)
+              VALUES ($1, $2, $3)
+              ON CONFLICT (device_id) DO NOTHING
+            `, [tryDevice, 'banned account signed in from this device', user.id]);
+          } catch (e) {}
+        }
         return res
           .status(403)
           .json({
@@ -1191,7 +1350,15 @@ app.post(
           });
       }
 
+      const loginDevice = cleanDeviceId(req.body?.device_id);
+      const loginFingerprint = cleanFingerprint(req.body?.fingerprint);
+      if (await isDeviceBanned(loginDevice)) {
+        console.log('[device_ban] login blocked device=' + loginDevice + ' user=' + user.id);
+        return res.status(403).json({ error: 'device_banned' });
+      }
+
       await updateUserLocation(user.id, req);
+      await rememberDevice(user.id, loginDevice, loginFingerprint);
       recordVisit(user.id);
       recordAppOpen();
 
@@ -1952,6 +2119,38 @@ app.delete('/api/friends/:id', auth, async (req,res) => {
 ========================================================= */
 const friendPresence = new Map(); // userId -> last heartbeat ms
 
+// Nothing ever removed entries from this map, so every account that had
+// ever opened the app stayed in memory for the life of the process. It is
+// nothing at today's numbers, but it only ever grows -- and a map that only
+// grows is a slow leak waiting for the day the game gets popular. An entry
+// older than the online window can never make anyone look online again, so
+// it has no reason to be kept.
+const FRIEND_PRESENCE_TTL_MS = 5 * 60 * 1000;
+const friendPresenceSweeper = setInterval(() => {
+  const cutoff = Date.now() - FRIEND_PRESENCE_TTL_MS;
+  let removed = 0;
+  for (const [uid, at] of friendPresence.entries()) {
+    if (at < cutoff) { friendPresence.delete(uid); removed++; }
+  }
+  if (removed) console.log('[friends] presence swept ' + removed + ' stale entr(ies), ' + friendPresence.size + ' left');
+}, 10 * 60 * 1000);
+if (friendPresenceSweeper.unref) friendPresenceSweeper.unref();
+
+// Slowest-hand throttle for private messages.
+//
+// The endpoint had no limit at all, so a script could push thousands of
+// rows into friend_messages as fast as the network allowed. Half a second
+// is far below anything a person types at and costs a real user nothing.
+const FRIEND_MSG_MIN_GAP_MS = 500;
+const friendMsgLastAt = new Map(); // userId -> last send ms
+const friendMsgSweeper = setInterval(() => {
+  const cutoff = Date.now() - 60 * 1000;
+  for (const [uid, at] of friendMsgLastAt.entries()) {
+    if (at < cutoff) friendMsgLastAt.delete(uid);
+  }
+}, 5 * 60 * 1000);
+if (friendMsgSweeper.unref) friendMsgSweeper.unref();
+
 async function initFriendChatTable() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS friend_messages (
@@ -2033,6 +2232,13 @@ app.post('/api/friends/:userId/messages', auth, async (req,res) => {
   try {
     const me=Number(req.user.id), other=Number(req.params.userId);
     if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    const now=Date.now();
+    const lastAt=friendMsgLastAt.get(me)||0;
+    if(now-lastAt < FRIEND_MSG_MIN_GAP_MS){
+      return res.status(429).json({error:'too_fast'});
+    }
+    friendMsgLastAt.set(me, now);
+
     const text=censorText(String(req.body?.text||'').slice(0,500).trim());
     if(!text) return res.status(400).json({error:'empty_message'});
     const r=await db.query(`INSERT INTO friend_messages(sender_id,recipient_id,text) VALUES($1,$2,$3) RETURNING id,created_at`,[me,other,text]);
@@ -7556,6 +7762,12 @@ app.post('/api/admin/users/:id/ban', adminOnly, async (req, res) => {
       return res.status(404).json({ error: 'user_not_found' });
     }
 
+    // The cached answer is now wrong; drop it so the change bites at once
+    // instead of up to thirty seconds later.
+    forgetBanState(userId);
+
+    let devicesAffected = 0;
+
     if (banned) {
       // Don't just flag them in the DB and let a match they're already
       // in keep running -- pull them out right now. Their opponent gets
@@ -7563,9 +7775,36 @@ app.post('/api/admin/users/:id/ban', adminOnly, async (req, res) => {
       // the ban check on find_match/reconnect stops them from queuing or
       // rejoining again with the same account.
       try { forceDisconnectUser(userId); } catch (e) {}
+
+      // Ban every handset this account has signed in from. Without this,
+      // the ban lasts about as long as it takes to tap "create account".
+      try {
+        const r = await db.query(`
+          INSERT INTO device_bans(device_id, reason, source_user)
+          SELECT device_id, $2, $1 FROM user_devices WHERE user_id=$1
+          ON CONFLICT (device_id) DO NOTHING
+        `, [userId, reason || 'owner account banned']);
+        devicesAffected = r.rowCount || 0;
+        console.log('[device_ban] user=' + userId + ' banned ' + devicesAffected + ' device(s)');
+      } catch (e) {
+        console.error('device ban insert failed:', e.message);
+      }
+    } else {
+      // Unbanning must give the phone back too, or the account is restored
+      // in name only and they still cannot get in.
+      try {
+        const r = await db.query(`
+          DELETE FROM device_bans
+          WHERE device_id IN (SELECT device_id FROM user_devices WHERE user_id=$1)
+        `, [userId]);
+        devicesAffected = r.rowCount || 0;
+        console.log('[device_ban] user=' + userId + ' released ' + devicesAffected + ' device(s)');
+      } catch (e) {
+        console.error('device unban failed:', e.message);
+      }
     }
 
-    res.json({ ok: true, user: updated.rows[0] });
+    res.json({ ok: true, user: updated.rows[0], devices: devicesAffected });
   } catch (e) {
     console.error('admin ban error:', e.message);
     res.status(500).json({ error: 'server_error' });
@@ -8431,10 +8670,15 @@ const pendingReconnects = new Map();
 // below cleans it up.
 const userSockets = new Map(); // userId -> Set<socketId>
 
+// The reverse lookup. The match chat has no token in its payload, so it
+// needs a way to ask who a socket belongs to.
+const socketUserId = new Map(); // socketId -> userId
+
 function registerUserSocket(userId, socketId) {
   if (!userId || !socketId) return;
   if (!userSockets.has(userId)) userSockets.set(userId, new Set());
   userSockets.get(userId).add(socketId);
+  socketUserId.set(socketId, userId);
 }
 
 function unregisterSocketEverywhere(socketId) {
@@ -8442,6 +8686,7 @@ function unregisterSocketEverywhere(socketId) {
     ids.delete(socketId);
     if (ids.size === 0) userSockets.delete(uid);
   }
+  socketUserId.delete(socketId);
 }
 
 // Called by POST /api/admin/users/:id/ban. Ends any match this user is
@@ -9082,6 +9327,20 @@ io.on(
       ) => {
         try {
           console.log('[find_match] called, socket=' + socket.id + ' options=' + JSON.stringify({goal: options.goal, stake: options.stake, hasToken: !!options.token, name: options.name}));
+
+          // A banned account may not start a match either. forceDisconnectUser
+          // pulls them out once; nothing stopped them simply reconnecting and
+          // queuing again with the token they already had.
+          try {
+            const fmToken = verifyMatchToken(options.token);
+            if (fmToken && fmToken.id && await isUserBanned(fmToken.id)) {
+              console.log('[find_match] refused: account banned user=' + fmToken.id);
+              return emitMatchError(socket, 'account_banned');
+            }
+          } catch (e) {
+            // Never let this check itself stop an ordinary player.
+          }
+
           const goal =
             [
               100,
@@ -9749,7 +10008,17 @@ io.on(
 
     socket.on(
       'chat_message',
-      payload => {
+      async payload => {
+        // Banned players stay out of the match chat too.
+        try {
+          const uid = socketUserId.get(socket.id);
+          if (uid && await isUserBanned(uid)) {
+            return emitMatchError(socket, 'account_banned');
+          }
+        } catch (e) {
+          // A failed check must never silence an ordinary player.
+        }
+
         const roomId =
           socketRoom.get(
             socket.id
@@ -9838,6 +10107,13 @@ io.on(
               socket,
               'login_required'
             );
+          }
+
+          // A banned account may not talk. The token in this payload was
+          // signed before the ban and still verifies perfectly, so without
+          // this check a banned player keeps chatting until it expires.
+          if (await isUserBanned(tokenPayload.id)) {
+            return emitMatchError(socket, 'account_banned');
           }
 
           // Enforce the closed chat HERE, not just by hiding the input box.
