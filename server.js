@@ -1827,6 +1827,124 @@ app.post('/api/admin/global-chat/:id/delete', adminOnly, async (req, res) => {
 
 
 /* =========================================================
+   FRIEND SYSTEM — PHASE 1
+   Isolated from game rooms/matchmaking: search, requests, accept/reject,
+   friend list and remove only. No game engine state is touched here.
+========================================================= */
+async function initFriendTables() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS friendships (
+      id BIGSERIAL PRIMARY KEY,
+      user_low INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_high INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      requested_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT friendships_pair_unique UNIQUE (user_low, user_high),
+      CONSTRAINT friendships_no_self CHECK (user_low <> user_high),
+      CONSTRAINT friendships_status CHECK (status IN ('pending','accepted'))
+    )
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS friendships_low_idx ON friendships(user_low, status)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friendships_high_idx ON friendships(user_high, status)`);
+}
+
+function friendPair(a, b) {
+  a = Number(a); b = Number(b);
+  return a < b ? [a,b] : [b,a];
+}
+
+app.get('/api/friends/search', auth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) return res.json({ users: [] });
+    const numericId = /^\d+$/.test(q) ? Number(q) : null;
+    const result = await db.query(`
+      SELECT id, username, avatar, photo_url
+      FROM users
+      WHERE id <> $1 AND banned = false
+        AND (($2::bigint IS NOT NULL AND id=$2) OR LOWER(COALESCE(username,'')) LIKE LOWER($3))
+      ORDER BY CASE WHEN $2::bigint IS NOT NULL AND id=$2 THEN 0 ELSE 1 END, username NULLS LAST
+      LIMIT 20
+    `, [req.user.id, numericId, '%' + q + '%']);
+    res.json({ users: result.rows.map(u => ({ id:Number(u.id), username:u.username || ('Player '+u.id), avatar:u.avatar||null, photo_url:u.photo_url||null })) });
+  } catch (e) {
+    console.error('friends search error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+app.get('/api/friends', auth, async (req, res) => {
+  try {
+    const uid = Number(req.user.id);
+    const result = await db.query(`
+      SELECT f.id AS friendship_id, f.status, f.requested_by,
+             u.id, u.username, u.avatar, u.photo_url
+      FROM friendships f
+      JOIN users u ON u.id = CASE WHEN f.user_low=$1 THEN f.user_high ELSE f.user_low END
+      WHERE (f.user_low=$1 OR f.user_high=$1)
+      ORDER BY f.updated_at DESC
+    `, [uid]);
+    const friends=[], incoming=[], outgoing=[];
+    for (const r of result.rows) {
+      const item={ friendship_id:Number(r.friendship_id), id:Number(r.id), username:r.username||('Player '+r.id), avatar:r.avatar||null, photo_url:r.photo_url||null };
+      if (r.status === 'accepted') friends.push(item);
+      else if (Number(r.requested_by) === uid) outgoing.push(item);
+      else incoming.push(item);
+    }
+    res.json({ friends, incoming, outgoing });
+  } catch (e) {
+    console.error('friends list error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+app.post('/api/friends/request', auth, async (req, res) => {
+  try {
+    const me=Number(req.user.id), target=Number(req.body?.user_id);
+    if (!Number.isInteger(target) || target===me) return res.status(400).json({ error:'invalid_user' });
+    const exists=await db.query(`SELECT id FROM users WHERE id=$1 AND banned=false`,[target]);
+    if (!exists.rows.length) return res.status(404).json({ error:'user_not_found' });
+    const [lo,hi]=friendPair(me,target);
+    const prior=await db.query(`SELECT * FROM friendships WHERE user_low=$1 AND user_high=$2`,[lo,hi]);
+    if (prior.rows.length) {
+      const f=prior.rows[0];
+      if (f.status==='accepted') return res.status(409).json({ error:'already_friends' });
+      if (Number(f.requested_by)===me) return res.status(409).json({ error:'request_already_sent' });
+      // Crossed requests: accepting is friendlier and prevents duplicate pending rows.
+      await db.query(`UPDATE friendships SET status='accepted', updated_at=NOW() WHERE id=$1`,[f.id]);
+      return res.json({ ok:true, accepted:true });
+    }
+    await db.query(`INSERT INTO friendships(user_low,user_high,requested_by,status) VALUES($1,$2,$3,'pending')`,[lo,hi,me]);
+    res.json({ ok:true, sent:true });
+  } catch(e){ console.error('friend request error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:id/respond', auth, async (req,res) => {
+  try {
+    const fid=Number(req.params.id), action=String(req.body?.action||'');
+    if (!Number.isInteger(fid) || !['accept','reject'].includes(action)) return res.status(400).json({error:'invalid_request'});
+    const uid=Number(req.user.id);
+    const found=await db.query(`SELECT * FROM friendships WHERE id=$1 AND status='pending' AND (user_low=$2 OR user_high=$2)`,[fid,uid]);
+    if (!found.rows.length) return res.status(404).json({error:'request_not_found'});
+    if (Number(found.rows[0].requested_by)===uid) return res.status(403).json({error:'not_request_recipient'});
+    if (action==='accept') await db.query(`UPDATE friendships SET status='accepted', updated_at=NOW() WHERE id=$1`,[fid]);
+    else await db.query(`DELETE FROM friendships WHERE id=$1`,[fid]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend respond error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.delete('/api/friends/:id', auth, async (req,res) => {
+  try {
+    const fid=Number(req.params.id), uid=Number(req.user.id);
+    if (!Number.isInteger(fid)) return res.status(400).json({error:'invalid_request'});
+    await db.query(`DELETE FROM friendships WHERE id=$1 AND (user_low=$2 OR user_high=$2)`,[fid,uid]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend remove error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+/* =========================================================
    TELEGRAM JOIN BONUS (simple version — no bot required)
    Person taps the banner -> opens the channel link -> app credits
    the one-time bonus right away. No membership verification, so
@@ -10491,6 +10609,8 @@ async function startServer() {
     await initVisitTables();
 
     await initGlobalChatTable();
+
+    await initFriendTables();
 
     await initTelegramJoinTable();
 
