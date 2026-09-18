@@ -968,150 +968,6 @@ async function initAdminUserTools() {
 }
 
 /* =========================================================
-   PAID MATCH REPLAY ARCHIVE (FAIL-OPEN / OBSERVATION ONLY)
-   This layer never decides turns, moves, winners, balances or settlement.
-   It only snapshots server-authoritative state already produced by the game.
-========================================================= */
-async function initPaidReplayTable() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS paid_match_replays (
-      match_id BIGINT PRIMARY KEY REFERENCES paid_matches(id) ON DELETE CASCADE,
-      room_id TEXT,
-      p1_user_id BIGINT,
-      p2_user_id BIGINT,
-      stake NUMERIC(20,8) NOT NULL DEFAULT 0,
-      rounds JSONB NOT NULL DEFAULT '[]'::jsonb,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  // Migration for databases created by an older replay build.
-  // CREATE TABLE IF NOT EXISTS does not add missing columns to an existing table.
-  // Keep this additive-only so it cannot affect paid-match/gameplay logic.
-  await db.query(`
-    ALTER TABLE paid_match_replays
-      ADD COLUMN IF NOT EXISTS room_id TEXT,
-      ADD COLUMN IF NOT EXISTS p1_user_id BIGINT,
-      ADD COLUMN IF NOT EXISTS p2_user_id BIGINT,
-      ADD COLUMN IF NOT EXISTS stake NUMERIC(20,8) NOT NULL DEFAULT 0,
-      ADD COLUMN IF NOT EXISTS rounds JSONB NOT NULL DEFAULT '[]'::jsonb,
-      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  `);
-}
-
-function paidReplaySnapshot(room) {
-  if (!room || !(Number(room.stake || 0) > 0) || !room.matchId) return null;
-  return {
-    roundSerial: Number(room.roundSerial || 0),
-    startedAt: Number(room.roundStartedAt || Date.now()),
-    archivedAt: Date.now(),
-    starterSeat: Number.isInteger(room.starterSeat) ? room.starterSeat : null,
-    initialHands: Array.isArray(room.initialHands) ? room.initialHands.map(h => Array.isArray(h) ? h.slice() : []) : [[],[]],
-    initialBoneyardCount: Number(room.initialBoneyardCount || 0),
-    actions: Array.isArray(room.log) ? room.log.map(x => ({...x})) : [],
-    scores: Array.isArray(room.scores) ? room.scores.slice() : null
-  };
-}
-
-async function archivePaidReplayRound(room) {
-  const snap = paidReplaySnapshot(room);
-  if (!snap || !snap.roundSerial) return false;
-  try {
-    const existing = await db.query(
-      `SELECT rounds FROM paid_match_replays WHERE match_id=$1`,
-      [Number(room.matchId)]
-    );
-    let rounds = existing.rows.length && Array.isArray(existing.rows[0].rounds)
-      ? existing.rows[0].rounds : [];
-    // Upsert this round snapshot instead of skipping an existing serial.
-    // We create an initial replay row when the round starts, then replace it
-    // with the completed authoritative log at round/match end. Observation only.
-    const replayRoundIndex = rounds.findIndex(
-      r => Number(r && r.roundSerial) === snap.roundSerial
-    );
-    if (replayRoundIndex >= 0) rounds[replayRoundIndex] = snap;
-    else rounds = rounds.concat([snap]);
-    await db.query(`
-      INSERT INTO paid_match_replays
-        (match_id, room_id, p1_user_id, p2_user_id, stake, rounds, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6::jsonb,NOW())
-      ON CONFLICT (match_id) DO UPDATE SET
-        rounds=EXCLUDED.rounds,
-        updated_at=NOW()
-    `, [
-      Number(room.matchId), String(room.roomId || ''),
-      Number(room.userIds && room.userIds[0]) || null,
-      Number(room.userIds && room.userIds[1]) || null,
-      Number(room.stake || 0), JSON.stringify(rounds)
-    ]);
-    return true;
-  } catch (e) {
-    console.error('[paid_replay] archive skipped (game unaffected):', e.message);
-    return false;
-  }
-}
-
-function archivePaidReplayRoundDetached(room) {
-  archivePaidReplayRound(room).catch(e =>
-    console.error('[paid_replay] detached archive skipped:', e.message)
-  );
-}
-
-app.get('/api/admin/replays', adminOnly, async (req, res) => {
-  try {
-    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
-    const result = await db.query(`
-      SELECT r.match_id, r.room_id, r.p1_user_id, r.p2_user_id, r.stake,
-             r.rounds, r.created_at, r.updated_at,
-             m.status, m.winner_user_id, m.prize, m.settled_at,
-             u1.username AS p1_username, u2.username AS p2_username
-      FROM paid_match_replays r
-      LEFT JOIN paid_matches m ON m.id=r.match_id
-      LEFT JOIN users u1 ON u1.id=r.p1_user_id
-      LEFT JOIN users u2 ON u2.id=r.p2_user_id
-      WHERE r.stake > 0
-      ORDER BY r.updated_at DESC
-      LIMIT $1
-    `, [limit]);
-    res.json({ replays: result.rows });
-  } catch (e) {
-    console.error('[paid_replay] admin list error:', e.message);
-    res.status(500).json({ error:'server_error' });
-  }
-});
-
-app.get('/api/admin/replays/:matchId', adminOnly, async (req, res) => {
-  try {
-    const matchId = Number(req.params.matchId);
-    if (!Number.isInteger(matchId)) return res.status(400).json({ error:'valid_match_id_required' });
-    const result = await db.query(`
-      SELECT r.*, m.status, m.winner_user_id, m.prize, m.settled_at,
-             u1.username AS p1_username, u2.username AS p2_username
-      FROM paid_match_replays r
-      LEFT JOIN paid_matches m ON m.id=r.match_id
-      LEFT JOIN users u1 ON u1.id=r.p1_user_id
-      LEFT JOIN users u2 ON u2.id=r.p2_user_id
-      WHERE r.match_id=$1 AND r.stake > 0
-      LIMIT 1
-    `, [matchId]);
-    if (!result.rows.length) return res.status(404).json({ error:'replay_not_found' });
-    res.json({ replay: result.rows[0] });
-  } catch (e) {
-    console.error('[paid_replay] admin detail error:', e.message);
-    // Temporary admin-only diagnostics: expose the database error to the
-    // authenticated admin so replay failures can be diagnosed without
-    // touching gameplay logic. Remove detail after the issue is fixed.
-    res.status(500).json({
-      error: 'server_error',
-      detail: String(e && e.message ? e.message : e),
-      code: e && e.code ? String(e.code) : null
-    });
-  }
-});
-
-/* =========================================================
    HEALTH
 ========================================================= */
 
@@ -9053,9 +8909,6 @@ async function finalizePlayerLeftRoom(socketId, guard) {
       });
     }
   } finally {
-    // Preserve the last authoritative paid round for admin replay. Never await:
-    // replay storage must not participate in money settlement or room cleanup.
-    archivePaidReplayRoundDetached(room);
     // Only now is it safe to destroy the in-memory room.
     // MULTI-ROOM SAFETY: a socket may already have moved on to a newer room.
     // An old room must NEVER erase that newer socketRoom mapping.
@@ -9074,7 +8927,6 @@ async function finalizePlayerLeftRoom(socketId, guard) {
 // room to corrupt a newer room's socket mapping. Idempotent and room-scoped.
 function cleanupCompletedRoom(roomId, room) {
   if (!room || rooms.get(roomId) !== room) return;
-  archivePaidReplayRoundDetached(room);
   clearRoomTurnTimer(room);
   for (const id of room.players || []) {
     if (socketRoom.get(id) === roomId) socketRoom.delete(id);
@@ -9366,11 +9218,6 @@ function startRound(room) {
   // (see 'resume_match'). Reset on every round since it only needs to
   // cover the round currently in progress.
   room.log = [];
-
-  // Create the paid replay record as soon as the authoritative round exists.
-  // This is detached/fail-open and cannot delay gameplay. The same round is
-  // replaced with its completed action log when it ends.
-  archivePaidReplayRoundDetached(room);
 
   emitWithRetry(
     room.players[0],
@@ -11006,9 +10853,6 @@ io.on(
         // room can be dealt twice and each phone receives a different hand.
         if (room._nextRoundLockUntil && Date.now() < room._nextRoundLockUntil) return;
         room._nextRoundLockUntil = Date.now() + 5000;
-        // Replay is observation-only and fail-open: snapshot the completed paid round
-        // without awaiting it, so storage can never delay or freeze gameplay.
-        archivePaidReplayRoundDetached(room);
         startRound(room);
       }
     );
@@ -11141,8 +10985,6 @@ async function startServer() {
     await initWalletTables();
 
     await initPaidMatchTables();
-
-    await initPaidReplayTable();
 
     await initAdminUserTools();
 
