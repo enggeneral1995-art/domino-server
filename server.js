@@ -1025,8 +1025,14 @@ async function archivePaidReplayRound(room) {
     );
     let rounds = existing.rows.length && Array.isArray(existing.rows[0].rounds)
       ? existing.rows[0].rounds : [];
-    if (rounds.some(r => Number(r && r.roundSerial) === snap.roundSerial)) return true;
-    rounds = rounds.concat([snap]);
+    // Upsert this round snapshot instead of skipping an existing serial.
+    // We create an initial replay row when the round starts, then replace it
+    // with the completed authoritative log at round/match end. Observation only.
+    const replayRoundIndex = rounds.findIndex(
+      r => Number(r && r.roundSerial) === snap.roundSerial
+    );
+    if (replayRoundIndex >= 0) rounds[replayRoundIndex] = snap;
+    else rounds = rounds.concat([snap]);
     await db.query(`
       INSERT INTO paid_match_replays
         (match_id, room_id, p1_user_id, p2_user_id, stake, rounds, updated_at)
@@ -9360,6 +9366,11 @@ function startRound(room) {
   // (see 'resume_match'). Reset on every round since it only needs to
   // cover the round currently in progress.
   room.log = [];
+
+  // Create the paid replay record as soon as the authoritative round exists.
+  // This is detached/fail-open and cannot delay gameplay. The same round is
+  // replaced with its completed action log when it ends.
+  archivePaidReplayRoundDetached(room);
 
   emitWithRetry(
     room.players[0],
