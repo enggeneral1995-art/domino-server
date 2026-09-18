@@ -9177,9 +9177,34 @@ function boardChainFor(room) {
   return chain;
 }
 
-// stateForSeat/broadcastState removed along with resume_match/game_state --
-// see /areas/yalla-domino.md. The client no longer listens for game_state,
-// so these would only have been dead sends.
+function stateForSeat(room, seat) {
+  if (!room || !Array.isArray(room.players) || seat < 0 || seat > 1) return null;
+  const opp = seat === 0 ? 1 : 0;
+  return {
+    stateSerial: Number(room._stateSerial || 0),
+    roundSerial: room.roundSerial,
+    seat,
+    turnSeat: room.turnSeat,
+    yourHand: (room.hands && room.hands[seat] || []).slice(),
+    oppHandCount: (room.hands && room.hands[opp] || []).length,
+    boneyardCount: room.boneyard ? room.boneyard.length : 0,
+    leftEnd: room.leftEnd,
+    rightEnd: room.rightEnd,
+    turnDeadline: room.turnDeadline,
+    board: boardChainFor(room)
+  };
+}
+
+function broadcastState(room) {
+  if (!room || !Array.isArray(room.players)) return;
+  room._stateSerial = Number(room._stateSerial || 0) + 1;
+  for (let seat = 0; seat < 2; seat++) {
+    const sid = room.players[seat];
+    if (!sid) continue;
+    const state = stateForSeat(room, seat);
+    if (state) io.to(sid).emit('game_state', state);
+  }
+}
 
 function hasLegalMove(room, seat) {
   const hand = room && room.hands && room.hands[seat];
@@ -9233,6 +9258,8 @@ function applyCanonicalMove(room, seat, value, requestedSide, requestedRotation,
 
 function performServerAutoTurn(room, seat) {
   if (!room || room.turnSeat !== seat || !room.hands || !room.hands[seat]) return;
+  if (room._autoTurnRunning) return;
+  room._autoTurnRunning = true;
   const actions = [];
   let hand = room.hands[seat];
   let value = hand.find(v => derivePlacement(room, v, null));
@@ -9256,10 +9283,13 @@ function performServerAutoTurn(room, seat) {
     room.lastActivityAt = Date.now();
     room.turnSeat = seat === 0 ? 1 : 0;
   }
+  const actionId = String(room.roundSerial || 0) + ':' + String(++room._autoActionSeq);
   for (const sid of (room.players || [])) {
-    if (sid) io.to(sid).emit('server_auto_actions', { roundSerial: room.roundSerial, seat, actions, turnSeat: room.turnSeat });
+    if (sid) io.to(sid).emit('server_auto_actions', { actionId, roundSerial: room.roundSerial, seat, actions, turnSeat: room.turnSeat });
   }
+  room._autoTurnRunning = false;
   armRoomTurnTimer(room);
+  broadcastState(room);
 }
 
 function clearRoomTurnTimer(room) {
@@ -9272,9 +9302,11 @@ function armRoomTurnTimer(room) {
   clearRoomTurnTimer(room);
   const serial = room.roundSerial;
   const expectedSeat = room.turnSeat;
+  const generation = room._turnTimerGeneration = Number(room._turnTimerGeneration || 0) + 1;
   room.turnDeadline = Date.now() + 10000;
   room._turnTimer = setTimeout(() => {
-    if (!room || room.roundSerial !== serial || room.turnSeat !== expectedSeat) return;
+    if (!room || room._turnTimerGeneration !== generation || room.roundSerial !== serial || room.turnSeat !== expectedSeat) return;
+    room._turnTimer = null;
     performServerAutoTurn(room, expectedSeat);
   }, 10000);
 }
@@ -9300,6 +9332,9 @@ function startRound(room) {
   room.starterSeat = round.starterSeat;
   room.turnSeat = round.starterSeat;
   room.roundSerial = (room.roundSerial || 0) + 1;
+  room._stateSerial = 0;
+  room._autoActionSeq = 0;
+  room._autoTurnRunning = false;
   room.roundStartedAt = Date.now();
   room.lastActivityAt = Date.now();
   // Keep a bounded nonce history, not just the most recent request. Mobile
@@ -9333,6 +9368,9 @@ function startRound(room) {
       starterSeat:
         round.starterSeat,
 
+      roundSerial:
+        room.roundSerial,
+
       boneyardCount:
         room.boneyard.length,
 
@@ -9365,6 +9403,9 @@ function startRound(room) {
 
       starterSeat:
         round.starterSeat,
+
+      roundSerial:
+        room.roundSerial,
 
       boneyardCount:
         room.boneyard.length,
@@ -9991,11 +10032,15 @@ io.on(
           return;
         }
 
-        const seat =
-          room.players[0] ===
-          socket.id
-            ? 0
-            : 1;
+        const seat = Array.isArray(room.players) ? room.players.indexOf(socket.id) : -1;
+        if (seat < 0) {
+          socket.emit('draw_tile_result', { ok: false, error: 'not_in_room' });
+          return;
+        }
+        if (payload && payload.roundSerial != null && Number(payload.roundSerial) !== Number(room.roundSerial)) {
+          socket.emit('draw_tile_result', { ok:false, error:'stale_round', roundSerial:room.roundSerial, boneyard_left:room.boneyard.length });
+          return;
+        }
 
         // A retried request (lost response, client resends with the same
         // nonce) must never draw a second tile -- replay whatever we
@@ -10017,12 +10062,12 @@ io.on(
         // The server owns the turn. A stale/desynced client must not be able
         // to draw during the other player's turn.
         if (room.turnSeat != null && room.turnSeat !== seat) {
-          socket.emit('draw_tile_result', { ok: false, error: 'not_your_turn', boneyard_left: room.boneyard.length });
+          socket.emit('draw_tile_result', { ok: false, error: 'not_your_turn', roundSerial: room.roundSerial, boneyard_left: room.boneyard.length });
           return;
         }
 
         if (hasLegalMove(room, seat)) {
-          socket.emit('draw_tile_result', { ok: false, error: 'playable_tile_exists', boneyard_left: room.boneyard.length });
+          socket.emit('draw_tile_result', { ok: false, error: 'playable_tile_exists', roundSerial: room.roundSerial, boneyard_left: room.boneyard.length });
           return;
         }
 
@@ -10033,6 +10078,7 @@ io.on(
           const result = {
             ok: false,
             empty: true,
+            roundSerial: room.roundSerial,
             boneyard_left: 0
           };
           if (nonce) {
@@ -10071,6 +10117,7 @@ io.on(
         const result = {
           ok: true,
           value,
+          roundSerial: room.roundSerial,
           boneyard_left: room.boneyard.length
         };
         if (nonce) {
@@ -10090,6 +10137,7 @@ io.on(
             'opponent_drew',
             {
               value,
+              roundSerial: room.roundSerial,
 
               boneyard_left:
                 room
@@ -10098,6 +10146,7 @@ io.on(
             }
           );
         }
+        broadcastState(room);
       }
     );
 
@@ -10401,6 +10450,10 @@ io.on(
           if (typeof ack === 'function') ack({ ok: false, error: 'not_in_room' });
           return;
         }
+        if (message && message.roundSerial != null && Number(message.roundSerial) !== Number(room.roundSerial)) {
+          if (typeof ack === 'function') ack({ ok:false, error:'stale_round', roundSerial:room.roundSerial });
+          return;
+        }
         const type = message && message.type;
         const value = Number(message && message.value);
 
@@ -10433,7 +10486,7 @@ io.on(
             if (typeof ack === 'function') ack({ ok:false, error:result.error });
             return;
           }
-          acceptedMessage = Object.assign({}, message, { side:result.side, rotation:result.rotation });
+          acceptedMessage = Object.assign({}, message, { side:result.side, rotation:result.rotation, roundSerial: room.roundSerial });
         } else {
           // Passing is legal only when the boneyard is empty and there is no playable tile.
           if ((room.boneyard && room.boneyard.length) || hasLegalMove(room, seat)) {
@@ -10444,12 +10497,14 @@ io.on(
           if (room.log) room.log.push({ type:'pass', seat, nonce });
           room.lastActivityAt = Date.now();
           room.turnSeat = seat === 0 ? 1 : 0;
+          acceptedMessage = Object.assign({}, message, { roundSerial: room.roundSerial });
         }
         if (nonce) {
           moveNonceMap.set(nonce, { ok: true });
           while (moveNonceMap.size > 64) moveNonceMap.delete(moveNonceMap.keys().next().value);
         }
         armRoomTurnTimer(room);
+        broadcastState(room);
 
         const opponent =
           otherPlayer(
@@ -11051,12 +11106,35 @@ io.on(
       }
     );
 
-    // request_game_state / request_board_sync / resume_match removed:
-    // reverted to the original design where a disconnect forfeits
-    // immediately (see the 'disconnect' handler above) and the client
-    // trusts incremental game_move/opponent_drew/draw_tile_result events
-    // directly, exactly as the original working version did. See
-    // /areas/yalla-domino.md for why.
+    // Keep instant-forfeit reconnect behavior, but restore lightweight
+    // authoritative state sync. This does not reclaim a disconnected seat;
+    // it only lets a still-connected client self-heal if an incremental
+    // move/draw packet was delayed or missed.
+    socket.on('request_game_state', () => {
+      const roomId = socketRoom.get(socket.id);
+      const room = roomId ? rooms.get(roomId) : null;
+      if (!room || !Array.isArray(room.players)) return;
+      const seat = room.players.indexOf(socket.id);
+      if (seat < 0) return;
+      const state = stateForSeat(room, seat);
+      if (state) socket.emit('game_state', state);
+    });
+
+    socket.on('request_board_sync', () => {
+      const roomId = socketRoom.get(socket.id);
+      const room = roomId ? rooms.get(roomId) : null;
+      if (!room || !Array.isArray(room.players)) { socket.emit('board_sync_result', { ok:false }); return; }
+      const seat = room.players.indexOf(socket.id);
+      if (seat < 0) { socket.emit('board_sync_result', { ok:false }); return; }
+      socket.emit('board_sync_result', {
+        ok: true, seat, turnSeat: room.turnSeat, roundSerial: room.roundSerial,
+        yourHand: (room.hands && room.hands[seat] || []).slice(),
+        boneyardCount: room.boneyard ? room.boneyard.length : 0,
+        leftEnd: room.leftEnd, rightEnd: room.rightEnd,
+        turnDeadline: room.turnDeadline,
+        log: (room.log || []).map(a => Object.assign({}, a))
+      });
+    });
 
   }
 );
