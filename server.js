@@ -753,7 +753,45 @@ function publicUser(user) {
   };
 }
 
-function auth(
+// Is this account banned right now?
+//
+// A JWT is signed once and then believed until it expires, so a ban had no
+// effect on anyone already holding a token: they could still chat, add
+// friends and start matches. The token cannot be un-issued, so the answer
+// has to come from the database -- cached briefly, because otherwise every
+// single request would pay for a query.
+const bannedCache = new Map(); // userId -> { banned, at }
+const BANNED_CACHE_MS = 30 * 1000;
+
+function forgetBanState(userId) {
+  bannedCache.delete(Number(userId));
+}
+
+async function isUserBanned(userId) {
+  const id = Number(userId);
+  if (!Number.isInteger(id)) return false;
+  const hit = bannedCache.get(id);
+  const now = Date.now();
+  if (hit && now - hit.at < BANNED_CACHE_MS) return hit.banned;
+  try {
+    const r = await db.query('SELECT banned FROM users WHERE id=$1', [id]);
+    const banned = !!(r.rows.length && r.rows[0].banned);
+    bannedCache.set(id, { banned, at: now });
+    return banned;
+  } catch (e) {
+    // Fail open. A database wobble must not lock every player out.
+    console.error('ban state check failed:', e.message);
+    return false;
+  }
+}
+
+const bannedCacheSweeper = setInterval(() => {
+  const cutoff = Date.now() - BANNED_CACHE_MS;
+  for (const [id, v] of bannedCache.entries()) if (v.at < cutoff) bannedCache.delete(id);
+}, 5 * 60 * 1000);
+if (bannedCacheSweeper.unref) bannedCacheSweeper.unref();
+
+async function auth(
   req,
   res,
   next
@@ -784,6 +822,17 @@ function auth(
         token,
         JWT_SECRET
       );
+
+    // The signature being valid is not the same as the account being
+    // allowed. Check the ban before letting the request through.
+    if (await isUserBanned(req.user?.id)) {
+      return res
+        .status(403)
+        .json({
+          error:
+            'account_banned'
+        });
+    }
 
     next();
 
@@ -907,7 +956,8 @@ async function initAdminUserTools() {
       balance_before NUMERIC(20,8) NOT NULL,
       balance_after NUMERIC(20,8) NOT NULL,
       reason TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      read_at TIMESTAMPTZ
     )
   `);
 
@@ -916,6 +966,123 @@ async function initAdminUserTools() {
     ON admin_balance_audit(user_id, created_at DESC)
   `);
 }
+
+/* =========================================================
+   PAID MATCH REPLAY ARCHIVE (FAIL-OPEN / OBSERVATION ONLY)
+   This layer never decides turns, moves, winners, balances or settlement.
+   It only snapshots server-authoritative state already produced by the game.
+========================================================= */
+async function initPaidReplayTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS paid_match_replays (
+      match_id BIGINT PRIMARY KEY REFERENCES paid_matches(id) ON DELETE CASCADE,
+      room_id TEXT,
+      p1_user_id BIGINT,
+      p2_user_id BIGINT,
+      stake NUMERIC(20,8) NOT NULL DEFAULT 0,
+      rounds JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+function paidReplaySnapshot(room) {
+  if (!room || !(Number(room.stake || 0) > 0) || !room.matchId) return null;
+  return {
+    roundSerial: Number(room.roundSerial || 0),
+    startedAt: Number(room.roundStartedAt || Date.now()),
+    archivedAt: Date.now(),
+    starterSeat: Number.isInteger(room.starterSeat) ? room.starterSeat : null,
+    initialHands: Array.isArray(room.initialHands) ? room.initialHands.map(h => Array.isArray(h) ? h.slice() : []) : [[],[]],
+    initialBoneyardCount: Number(room.initialBoneyardCount || 0),
+    actions: Array.isArray(room.log) ? room.log.map(x => ({...x})) : [],
+    scores: Array.isArray(room.scores) ? room.scores.slice() : null
+  };
+}
+
+async function archivePaidReplayRound(room) {
+  const snap = paidReplaySnapshot(room);
+  if (!snap || !snap.roundSerial) return false;
+  try {
+    const existing = await db.query(
+      `SELECT rounds FROM paid_match_replays WHERE match_id=$1`,
+      [Number(room.matchId)]
+    );
+    let rounds = existing.rows.length && Array.isArray(existing.rows[0].rounds)
+      ? existing.rows[0].rounds : [];
+    if (rounds.some(r => Number(r && r.roundSerial) === snap.roundSerial)) return true;
+    rounds = rounds.concat([snap]);
+    await db.query(`
+      INSERT INTO paid_match_replays
+        (match_id, room_id, p1_user_id, p2_user_id, stake, rounds, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6::jsonb,NOW())
+      ON CONFLICT (match_id) DO UPDATE SET
+        rounds=EXCLUDED.rounds,
+        updated_at=NOW()
+    `, [
+      Number(room.matchId), String(room.roomId || ''),
+      Number(room.userIds && room.userIds[0]) || null,
+      Number(room.userIds && room.userIds[1]) || null,
+      Number(room.stake || 0), JSON.stringify(rounds)
+    ]);
+    return true;
+  } catch (e) {
+    console.error('[paid_replay] archive skipped (game unaffected):', e.message);
+    return false;
+  }
+}
+
+function archivePaidReplayRoundDetached(room) {
+  archivePaidReplayRound(room).catch(e =>
+    console.error('[paid_replay] detached archive skipped:', e.message)
+  );
+}
+
+app.get('/api/admin/replays', adminOnly, async (req, res) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+    const result = await db.query(`
+      SELECT r.match_id, r.room_id, r.p1_user_id, r.p2_user_id, r.stake,
+             r.rounds, r.created_at, r.updated_at,
+             m.status, m.winner_user_id, m.prize, m.settled_at,
+             u1.username AS p1_username, u2.username AS p2_username
+      FROM paid_match_replays r
+      LEFT JOIN paid_matches m ON m.id=r.match_id
+      LEFT JOIN users u1 ON u1.id=r.p1_user_id
+      LEFT JOIN users u2 ON u2.id=r.p2_user_id
+      WHERE r.stake > 0
+      ORDER BY r.updated_at DESC
+      LIMIT $1
+    `, [limit]);
+    res.json({ replays: result.rows });
+  } catch (e) {
+    console.error('[paid_replay] admin list error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+app.get('/api/admin/replays/:matchId', adminOnly, async (req, res) => {
+  try {
+    const matchId = Number(req.params.matchId);
+    if (!Number.isInteger(matchId)) return res.status(400).json({ error:'valid_match_id_required' });
+    const result = await db.query(`
+      SELECT r.*, m.status, m.winner_user_id, m.prize, m.settled_at,
+             u1.username AS p1_username, u2.username AS p2_username
+      FROM paid_match_replays r
+      LEFT JOIN paid_matches m ON m.id=r.match_id
+      LEFT JOIN users u1 ON u1.id=r.p1_user_id
+      LEFT JOIN users u2 ON u2.id=r.p2_user_id
+      WHERE r.match_id=$1 AND r.stake > 0
+      LIMIT 1
+    `, [matchId]);
+    if (!result.rows.length) return res.status(404).json({ error:'replay_not_found' });
+    res.json({ replay: result.rows[0] });
+  } catch (e) {
+    console.error('[paid_replay] admin detail error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
 
 /* =========================================================
    HEALTH
@@ -950,6 +1117,16 @@ app.post(
         password
       } =
         req.body || {};
+
+      // A banned handset may not open a fresh account. This is the whole
+      // point of the feature: the account ban is trivially sidestepped by
+      // signing up again on the same phone.
+      const regDevice = cleanDeviceId(req.body?.device_id);
+      const regFingerprint = cleanFingerprint(req.body?.fingerprint);
+      if (await isDeviceBanned(regDevice)) {
+        console.log('[device_ban] register blocked device=' + regDevice);
+        return res.status(403).json({ error: 'device_banned' });
+      }
 
       if (
         !email ||
@@ -1044,6 +1221,7 @@ app.post(
         result.rows[0];
 
       await updateUserLocation(user.id, req);
+      await rememberDevice(user.id, regDevice, regFingerprint);
 
       const refreshed =
         await db.query(
@@ -1077,6 +1255,93 @@ app.post(
     }
   }
 );
+
+/* =========================================================
+   DEVICE BANS
+
+   A ban on an account stops that account. It does nothing about the
+   person, who simply signs up again on the same phone a minute later.
+   This ties bans to the handset as well.
+
+   What this can and cannot do, plainly:
+
+     - It CAN stop the ordinary case: someone banned, opening the app on
+       the same phone, making a new account. That is what actually
+       happens.
+     - It CANNOT be absolute. A browser has no true device identity. Wipe
+       the site data, use a private window, or switch browser and the
+       marker is gone. Anyone claiming otherwise about a web app is
+       guessing.
+
+   So the marker is stored twice -- localStorage and a long-lived cookie --
+   because people clear one far more often than both, and a fingerprint is
+   recorded alongside it for an admin to look at. The fingerprint is NOT
+   used to block automatically: two identical phone models in the same
+   city produce the same fingerprint, and banning a stranger by accident
+   is worse than missing one evader.
+========================================================= */
+
+async function ensureDeviceTables() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS device_bans (
+      device_id   TEXT PRIMARY KEY,
+      reason      TEXT,
+      banned_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      source_user BIGINT
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS user_devices (
+      user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      device_id   TEXT NOT NULL,
+      fingerprint TEXT,
+      first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, device_id)
+    )
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS user_devices_device_idx ON user_devices(device_id)`);
+}
+ensureDeviceTables().catch(e => console.error('device tables error:', e.message));
+
+// Accept only something we issued: 32 hex characters. Anything else is
+// treated as "no device", never as a value to store.
+function cleanDeviceId(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return /^[a-f0-9]{32}$/.test(s) ? s : null;
+}
+
+function cleanFingerprint(v) {
+  const s = String(v || '').trim();
+  return s ? s.slice(0, 120) : null;
+}
+
+async function isDeviceBanned(deviceId) {
+  if (!deviceId) return false;
+  try {
+    const r = await db.query('SELECT 1 FROM device_bans WHERE device_id=$1 LIMIT 1', [deviceId]);
+    return !!r.rows.length;
+  } catch (e) {
+    // Fail open: a database hiccup must not lock out the whole player base.
+    console.error('device ban check failed:', e.message);
+    return false;
+  }
+}
+
+async function rememberDevice(userId, deviceId, fingerprint) {
+  if (!userId || !deviceId) return;
+  try {
+    await db.query(`
+      INSERT INTO user_devices(user_id, device_id, fingerprint)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, device_id)
+      DO UPDATE SET last_seen = NOW(),
+                    fingerprint = COALESCE(EXCLUDED.fingerprint, user_devices.fingerprint)
+    `, [userId, deviceId, fingerprint]);
+  } catch (e) {
+    console.error('remember device failed:', e.message);
+  }
+}
 
 /* =========================================================
    LOGIN
@@ -1182,6 +1447,18 @@ app.post(
       }
 
       if (user.banned) {
+        // Sign-in by a banned account also marks the handset, so the next
+        // move -- opening a fresh account on this phone -- is already shut.
+        const tryDevice = cleanDeviceId(req.body?.device_id);
+        if (tryDevice) {
+          try {
+            await db.query(`
+              INSERT INTO device_bans(device_id, reason, source_user)
+              VALUES ($1, $2, $3)
+              ON CONFLICT (device_id) DO NOTHING
+            `, [tryDevice, 'banned account signed in from this device', user.id]);
+          } catch (e) {}
+        }
         return res
           .status(403)
           .json({
@@ -1190,7 +1467,15 @@ app.post(
           });
       }
 
+      const loginDevice = cleanDeviceId(req.body?.device_id);
+      const loginFingerprint = cleanFingerprint(req.body?.fingerprint);
+      if (await isDeviceBanned(loginDevice)) {
+        console.log('[device_ban] login blocked device=' + loginDevice + ' user=' + user.id);
+        return res.status(403).json({ error: 'device_banned' });
+      }
+
       await updateUserLocation(user.id, req);
+      await rememberDevice(user.id, loginDevice, loginFingerprint);
       recordVisit(user.id);
       recordAppOpen();
 
@@ -1763,6 +2048,342 @@ app.get('/api/global-chat/history', async (req, res) => {
     console.error('global-chat/history error:', e.message);
     res.status(500).json({ error: 'server_error' });
   }
+});
+
+/* =========================================================
+   ADMIN — GLOBAL CHAT MANAGEMENT
+   Admin panel can review recent public-chat messages and
+   delete a selected message. Deletion is broadcast live so
+   it disappears immediately for everyone currently online.
+========================================================= */
+
+app.get('/api/admin/global-chat/messages', adminOnly, async (_req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT id, user_id, name, text, created_at
+      FROM global_chat_messages
+      WHERE deleted = false
+      ORDER BY created_at DESC
+      LIMIT 300
+    `);
+
+    res.json({
+      messages: result.rows.map(row => ({
+        id: row.id,
+        userId: row.user_id,
+        name: row.name,
+        text: row.text,
+        ts: new Date(row.created_at).getTime()
+      }))
+    });
+  } catch (e) {
+    console.error('admin global-chat list error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/global-chat/:id/delete', adminOnly, async (req, res) => {
+  try {
+    const messageId = Number(req.params.id);
+    if (!Number.isInteger(messageId)) {
+      return res.status(400).json({ error: 'valid_message_id_required' });
+    }
+
+    const updated = await db.query(
+      `UPDATE global_chat_messages
+       SET deleted=true
+       WHERE id=$1 AND deleted=false
+       RETURNING id`,
+      [messageId]
+    );
+
+    if (!updated.rows.length) {
+      return res.status(404).json({ error: 'message_not_found' });
+    }
+
+    // Existing clients already listen for this event.
+    io.emit('global_chat_message_deleted', { id: messageId });
+    res.json({ ok: true, id: messageId });
+  } catch (e) {
+    console.error('admin global-chat delete error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+
+/* =========================================================
+   FRIEND SYSTEM — PHASE 1
+   Isolated from game rooms/matchmaking: search, requests, accept/reject,
+   friend list and remove only. No game engine state is touched here.
+========================================================= */
+async function initFriendTables() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS friendships (
+      id BIGSERIAL PRIMARY KEY,
+      user_low INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_high INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      requested_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT friendships_pair_unique UNIQUE (user_low, user_high),
+      CONSTRAINT friendships_no_self CHECK (user_low <> user_high),
+      CONSTRAINT friendships_status CHECK (status IN ('pending','accepted'))
+    )
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS friendships_low_idx ON friendships(user_low, status)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friendships_high_idx ON friendships(user_high, status)`);
+}
+
+function friendPair(a, b) {
+  a = Number(a); b = Number(b);
+  return a < b ? [a,b] : [b,a];
+}
+
+app.get('/api/friends/search', auth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) return res.json({ users: [] });
+    const numericId = /^\d+$/.test(q) ? Number(q) : null;
+    const result = await db.query(`
+      SELECT id, username, avatar, photo_url
+      FROM users
+      WHERE id <> $1 AND banned = false
+        AND (($2::bigint IS NOT NULL AND id=$2) OR LOWER(COALESCE(username,'')) LIKE LOWER($3))
+      ORDER BY CASE WHEN $2::bigint IS NOT NULL AND id=$2 THEN 0 ELSE 1 END, username NULLS LAST
+      LIMIT 20
+    `, [req.user.id, numericId, '%' + q + '%']);
+    res.json({ users: result.rows.map(u => ({ id:Number(u.id), username:u.username || ('Player '+u.id), avatar:u.avatar||null, photo_url:u.photo_url||null })) });
+  } catch (e) {
+    console.error('friends search error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+app.get('/api/friends', auth, async (req, res) => {
+  try {
+    const uid = Number(req.user.id);
+    const result = await db.query(`
+      SELECT f.id AS friendship_id, f.status, f.requested_by,
+             u.id, u.username, u.avatar, u.photo_url
+      FROM friendships f
+      JOIN users u ON u.id = CASE WHEN f.user_low=$1 THEN f.user_high ELSE f.user_low END
+      WHERE (f.user_low=$1 OR f.user_high=$1)
+      ORDER BY f.updated_at DESC
+    `, [uid]);
+    const friends=[], incoming=[], outgoing=[];
+    for (const r of result.rows) {
+      const item={ friendship_id:Number(r.friendship_id), id:Number(r.id), username:r.username||('Player '+r.id), avatar:r.avatar||null, photo_url:r.photo_url||null };
+      if (r.status === 'accepted') friends.push(item);
+      else if (Number(r.requested_by) === uid) outgoing.push(item);
+      else incoming.push(item);
+    }
+    res.json({ friends, incoming, outgoing });
+  } catch (e) {
+    console.error('friends list error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+app.post('/api/friends/request', auth, async (req, res) => {
+  try {
+    const me=Number(req.user.id), target=Number(req.body?.user_id);
+    if (!Number.isInteger(target) || target===me) return res.status(400).json({ error:'invalid_user' });
+    const exists=await db.query(`SELECT id FROM users WHERE id=$1 AND banned=false`,[target]);
+    if (!exists.rows.length) return res.status(404).json({ error:'user_not_found' });
+    const [lo,hi]=friendPair(me,target);
+    const prior=await db.query(`SELECT * FROM friendships WHERE user_low=$1 AND user_high=$2`,[lo,hi]);
+    if (prior.rows.length) {
+      const f=prior.rows[0];
+      if (f.status==='accepted') return res.status(409).json({ error:'already_friends' });
+      if (Number(f.requested_by)===me) return res.status(409).json({ error:'request_already_sent' });
+      // Crossed requests: accepting is friendlier and prevents duplicate pending rows.
+      await db.query(`UPDATE friendships SET status='accepted', updated_at=NOW() WHERE id=$1`,[f.id]);
+      return res.json({ ok:true, accepted:true });
+    }
+    await db.query(`INSERT INTO friendships(user_low,user_high,requested_by,status) VALUES($1,$2,$3,'pending')`,[lo,hi,me]);
+    res.json({ ok:true, sent:true });
+  } catch(e){ console.error('friend request error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:id/respond', auth, async (req,res) => {
+  try {
+    const fid=Number(req.params.id), action=String(req.body?.action||'');
+    if (!Number.isInteger(fid) || !['accept','reject'].includes(action)) return res.status(400).json({error:'invalid_request'});
+    const uid=Number(req.user.id);
+    const found=await db.query(`SELECT * FROM friendships WHERE id=$1 AND status='pending' AND (user_low=$2 OR user_high=$2)`,[fid,uid]);
+    if (!found.rows.length) return res.status(404).json({error:'request_not_found'});
+    if (Number(found.rows[0].requested_by)===uid) return res.status(403).json({error:'not_request_recipient'});
+    if (action==='accept') await db.query(`UPDATE friendships SET status='accepted', updated_at=NOW() WHERE id=$1`,[fid]);
+    else await db.query(`DELETE FROM friendships WHERE id=$1`,[fid]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend respond error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.delete('/api/friends/:id', auth, async (req,res) => {
+  try {
+    const fid=Number(req.params.id), uid=Number(req.user.id);
+    if (!Number.isInteger(fid)) return res.status(400).json({error:'invalid_request'});
+    await db.query(`DELETE FROM friendships WHERE id=$1 AND (user_low=$2 OR user_high=$2)`,[fid,uid]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend remove error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+/* =========================================================
+   FRIEND SYSTEM — PHASE 2
+   Presence + private 1:1 friend chat. Deliberately isolated from all
+   domino rooms, turns, scoring, matchmaking and wallet code.
+========================================================= */
+const friendPresence = new Map(); // userId -> last heartbeat ms
+
+// Nothing ever removed entries from this map, so every account that had
+// ever opened the app stayed in memory for the life of the process. It is
+// nothing at today's numbers, but it only ever grows -- and a map that only
+// grows is a slow leak waiting for the day the game gets popular. An entry
+// older than the online window can never make anyone look online again, so
+// it has no reason to be kept.
+const FRIEND_PRESENCE_TTL_MS = 5 * 60 * 1000;
+const friendPresenceSweeper = setInterval(() => {
+  const cutoff = Date.now() - FRIEND_PRESENCE_TTL_MS;
+  let removed = 0;
+  for (const [uid, at] of friendPresence.entries()) {
+    if (at < cutoff) { friendPresence.delete(uid); removed++; }
+  }
+  if (removed) console.log('[friends] presence swept ' + removed + ' stale entr(ies), ' + friendPresence.size + ' left');
+}, 10 * 60 * 1000);
+if (friendPresenceSweeper.unref) friendPresenceSweeper.unref();
+
+// Slowest-hand throttle for private messages.
+//
+// The endpoint had no limit at all, so a script could push thousands of
+// rows into friend_messages as fast as the network allowed. Half a second
+// is far below anything a person types at and costs a real user nothing.
+const FRIEND_MSG_MIN_GAP_MS = 500;
+const friendMsgLastAt = new Map(); // userId -> last send ms
+const friendMsgSweeper = setInterval(() => {
+  const cutoff = Date.now() - 60 * 1000;
+  for (const [uid, at] of friendMsgLastAt.entries()) {
+    if (at < cutoff) friendMsgLastAt.delete(uid);
+  }
+}, 5 * 60 * 1000);
+if (friendMsgSweeper.unref) friendMsgSweeper.unref();
+
+async function initFriendChatTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS friend_messages (
+      id BIGSERIAL PRIMARY KEY,
+      sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await db.query(`ALTER TABLE friend_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_pair_idx ON friend_messages(sender_id, recipient_id, id DESC)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_recipient_idx ON friend_messages(recipient_id, id DESC)`);
+}
+
+async function areAcceptedFriends(a,b) {
+  const [lo,hi]=friendPair(a,b);
+  const r=await db.query(`SELECT 1 FROM friendships WHERE user_low=$1 AND user_high=$2 AND status='accepted' LIMIT 1`,[lo,hi]);
+  return !!r.rows.length;
+}
+
+app.post('/api/friends/presence', auth, async (req,res) => {
+  friendPresence.set(Number(req.user.id), Date.now());
+  res.json({ok:true});
+});
+
+app.get('/api/friends/presence', auth, async (req,res) => {
+  try {
+    const uid=Number(req.user.id), now=Date.now();
+    friendPresence.set(uid, now);
+    const r=await db.query(`SELECT CASE WHEN user_low=$1 THEN user_high ELSE user_low END AS id FROM friendships WHERE (user_low=$1 OR user_high=$1) AND status='accepted'`,[uid]);
+    const online={};
+    for(const row of r.rows){ const id=Number(row.id); online[id]=(now-(friendPresence.get(id)||0)) < 65000; }
+    res.json({online});
+  } catch(e){ console.error('friend presence error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.get('/api/friends/unread', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id);
+    const r=await db.query(`
+      SELECT sender_id AS id, COUNT(*)::int AS count, MAX(created_at) AS last_at
+      FROM friend_messages
+      WHERE recipient_id=$1 AND read_at IS NULL
+      GROUP BY sender_id
+    `,[me]);
+    const unread={};
+    for(const x of r.rows) unread[Number(x.id)]={count:Number(x.count)||0,lastTs:new Date(x.last_at).getTime()};
+    res.json({unread});
+  } catch(e){ console.error('friend unread error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:userId/read', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    await db.query(`UPDATE friend_messages SET read_at=NOW() WHERE sender_id=$1 AND recipient_id=$2 AND read_at IS NULL`,[other,me]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend read error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.get('/api/friends/:userId/messages', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    const after=Math.max(0,Number(req.query.after)||0);
+    const r=await db.query(`
+      SELECT id, sender_id, recipient_id, text, created_at
+      FROM friend_messages
+      WHERE ((sender_id=$1 AND recipient_id=$2) OR (sender_id=$2 AND recipient_id=$1))
+        AND id > $3
+      ORDER BY id ASC LIMIT 100
+    `,[me,other,after]);
+    res.json({messages:r.rows.map(x=>({id:Number(x.id),sender_id:Number(x.sender_id),recipient_id:Number(x.recipient_id),text:x.text,ts:new Date(x.created_at).getTime()}))});
+  } catch(e){ console.error('friend messages error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:userId/messages', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    const now=Date.now();
+    const lastAt=friendMsgLastAt.get(me)||0;
+    if(now-lastAt < FRIEND_MSG_MIN_GAP_MS){
+      return res.status(429).json({error:'too_fast'});
+    }
+    friendMsgLastAt.set(me, now);
+
+    const text=censorText(String(req.body?.text||'').slice(0,500).trim());
+    if(!text) return res.status(400).json({error:'empty_message'});
+    const r=await db.query(`INSERT INTO friend_messages(sender_id,recipient_id,text) VALUES($1,$2,$3) RETURNING id,created_at`,[me,other,text]);
+    friendPresence.set(me,Date.now());
+    res.json({ok:true,message:{id:Number(r.rows[0].id),sender_id:me,recipient_id:other,text,ts:new Date(r.rows[0].created_at).getTime()}});
+  } catch(e){ console.error('friend send message error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+/* Admin moderation — private friend chat review. Read-only by design. */
+app.get('/api/admin/friend-chat/messages', adminOnly, async (req,res) => {
+  try {
+    const limit=Math.min(500,Math.max(1,Number(req.query.limit)||300));
+    const r=await db.query(`
+      SELECT m.id, m.sender_id, m.recipient_id, m.text, m.created_at,
+             COALESCE(s.username, 'Player ' || m.sender_id::text) AS sender_name,
+             COALESCE(rc.username, 'Player ' || m.recipient_id::text) AS recipient_name
+      FROM friend_messages m
+      LEFT JOIN users s ON s.id=m.sender_id
+      LEFT JOIN users rc ON rc.id=m.recipient_id
+      ORDER BY m.id DESC
+      LIMIT $1
+    `,[limit]);
+    res.json({messages:r.rows.map(x=>({
+      id:Number(x.id), senderId:Number(x.sender_id), recipientId:Number(x.recipient_id),
+      senderName:x.sender_name, recipientName:x.recipient_name, text:x.text,
+      ts:new Date(x.created_at).getTime()
+    }))});
+  } catch(e){ console.error('admin friend chat error:',e.message); res.status(500).json({error:'server_error'}); }
 });
 
 /* =========================================================
@@ -4989,72 +5610,6 @@ async function initPaidMatchTables() {
   `);
 }
 
-
-
-/* =========================================================
-   PAID MATCH REPLAY ARCHIVE (FAIL-OPEN / OBSERVATION ONLY)
-   This layer never participates in turn validation, scoring, wallet
-   settlement, matchmaking, reconnects, or winner selection. Any replay
-   database error is swallowed so gameplay can continue unchanged.
-========================================================= */
-async function initPaidReplayTables() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS paid_match_replays (
-      match_id BIGINT PRIMARY KEY REFERENCES paid_matches(id) ON DELETE CASCADE,
-      replay JSONB NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-}
-
-function replayRoundSnapshot(room) {
-  if (!room || Number(room.stake || 0) <= 0 || !room.matchId || !room.initialHands) return null;
-  return {
-    roundSerial: Number(room.roundSerial || 0),
-    startedAt: room.roundStartedAt || null,
-    starterSeat: room.starterSeat,
-    initialHands: [
-      Array.isArray(room.initialHands[0]) ? room.initialHands[0].slice() : [],
-      Array.isArray(room.initialHands[1]) ? room.initialHands[1].slice() : []
-    ],
-    initialBoneyardCount: Number(room.initialBoneyardCount || 0),
-    events: Array.isArray(room.log) ? room.log.map(function(e){ return Object.assign({}, e); }) : []
-  };
-}
-
-function archiveCurrentReplayRound(room) {
-  const snap = replayRoundSnapshot(room);
-  if (!snap) return;
-  if (!Array.isArray(room.replayRounds)) room.replayRounds = [];
-  const i = room.replayRounds.findIndex(function(r){ return Number(r.roundSerial) === Number(snap.roundSerial); });
-  if (i >= 0) room.replayRounds[i] = snap; else room.replayRounds.push(snap);
-}
-
-function persistPaidReplay(room, reason) {
-  // Intentionally fire-and-forget: replay storage must NEVER delay or fail a paid game.
-  if (!room || Number(room.stake || 0) <= 0 || !room.matchId) return;
-  try { archiveCurrentReplayRound(room); } catch (e) { console.warn('[paid_replay] snapshot skipped:', e.message); }
-  const payload = {
-    version: 1,
-    matchId: Number(room.matchId),
-    roomId: room.roomId || null,
-    stake: Number(room.stake || 0),
-    prize: Number(room.prize || 0),
-    goal: Number(room.goal || 0),
-    userIds: Array.isArray(room.userIds) ? room.userIds.slice(0,2) : [],
-    savedReason: reason || 'snapshot',
-    savedAt: Date.now(),
-    rounds: Array.isArray(room.replayRounds) ? room.replayRounds.slice() : []
-  };
-  db.query(`
-    INSERT INTO paid_match_replays (match_id, replay, updated_at)
-    VALUES ($1, $2::jsonb, NOW())
-    ON CONFLICT (match_id) DO UPDATE SET replay=EXCLUDED.replay, updated_at=NOW()
-  `, [room.matchId, JSON.stringify(payload)]).catch(function(e){
-    console.warn('[paid_replay] persist failed matchId=' + room.matchId + ': ' + e.message);
-  });
-}
-
 /* =========================================================
    TOURNAMENT (MONTHLY LEADERBOARD)
 ========================================================= */
@@ -7324,6 +7879,12 @@ app.post('/api/admin/users/:id/ban', adminOnly, async (req, res) => {
       return res.status(404).json({ error: 'user_not_found' });
     }
 
+    // The cached answer is now wrong; drop it so the change bites at once
+    // instead of up to thirty seconds later.
+    forgetBanState(userId);
+
+    let devicesAffected = 0;
+
     if (banned) {
       // Don't just flag them in the DB and let a match they're already
       // in keep running -- pull them out right now. Their opponent gets
@@ -7331,9 +7892,36 @@ app.post('/api/admin/users/:id/ban', adminOnly, async (req, res) => {
       // the ban check on find_match/reconnect stops them from queuing or
       // rejoining again with the same account.
       try { forceDisconnectUser(userId); } catch (e) {}
+
+      // Ban every handset this account has signed in from. Without this,
+      // the ban lasts about as long as it takes to tap "create account".
+      try {
+        const r = await db.query(`
+          INSERT INTO device_bans(device_id, reason, source_user)
+          SELECT device_id, $2, $1 FROM user_devices WHERE user_id=$1
+          ON CONFLICT (device_id) DO NOTHING
+        `, [userId, reason || 'owner account banned']);
+        devicesAffected = r.rowCount || 0;
+        console.log('[device_ban] user=' + userId + ' banned ' + devicesAffected + ' device(s)');
+      } catch (e) {
+        console.error('device ban insert failed:', e.message);
+      }
+    } else {
+      // Unbanning must give the phone back too, or the account is restored
+      // in name only and they still cannot get in.
+      try {
+        const r = await db.query(`
+          DELETE FROM device_bans
+          WHERE device_id IN (SELECT device_id FROM user_devices WHERE user_id=$1)
+        `, [userId]);
+        devicesAffected = r.rowCount || 0;
+        console.log('[device_ban] user=' + userId + ' released ' + devicesAffected + ' device(s)');
+      } catch (e) {
+        console.error('device unban failed:', e.message);
+      }
     }
 
-    res.json({ ok: true, user: updated.rows[0] });
+    res.json({ ok: true, user: updated.rows[0], devices: devicesAffected });
   } catch (e) {
     console.error('admin ban error:', e.message);
     res.status(500).json({ error: 'server_error' });
@@ -7487,38 +8075,6 @@ app.get(
     }
   }
 );
-
-
-
-app.get('/api/admin/matches/:id/replay', adminOnly, async (req, res) => {
-  try {
-    const matchId = Number(req.params.id);
-    if (!Number.isInteger(matchId) || matchId <= 0) return res.status(400).json({ error: 'valid_id_required' });
-    const result = await db.query(`
-      SELECT r.replay, r.updated_at, m.stake, m.status,
-             u1.username AS p1_username, u2.username AS p2_username,
-             m.p1_user_id, m.p2_user_id
-      FROM paid_matches m
-      LEFT JOIN paid_match_replays r ON r.match_id=m.id
-      LEFT JOIN users u1 ON u1.id=m.p1_user_id
-      LEFT JOIN users u2 ON u2.id=m.p2_user_id
-      WHERE m.id=$1 AND m.stake > 0
-    `, [matchId]);
-    if (!result.rows.length) return res.status(404).json({ error: 'paid_match_not_found' });
-    if (!result.rows[0].replay) return res.status(404).json({ error: 'replay_not_available' });
-    res.json({
-      replay: result.rows[0].replay,
-      updated_at: result.rows[0].updated_at,
-      players: [
-        { id: result.rows[0].p1_user_id, username: result.rows[0].p1_username },
-        { id: result.rows[0].p2_user_id, username: result.rows[0].p2_username }
-      ]
-    });
-  } catch (e) {
-    console.error('admin replay error:', e.message);
-    res.status(500).json({ error: 'server_error' });
-  }
-});
 
 app.post(
   '/api/admin/matches/:id/refund',
@@ -8231,10 +8787,15 @@ const pendingReconnects = new Map();
 // below cleans it up.
 const userSockets = new Map(); // userId -> Set<socketId>
 
+// The reverse lookup. The match chat has no token in its payload, so it
+// needs a way to ask who a socket belongs to.
+const socketUserId = new Map(); // socketId -> userId
+
 function registerUserSocket(userId, socketId) {
   if (!userId || !socketId) return;
   if (!userSockets.has(userId)) userSockets.set(userId, new Set());
   userSockets.get(userId).add(socketId);
+  socketUserId.set(socketId, userId);
 }
 
 function unregisterSocketEverywhere(socketId) {
@@ -8242,6 +8803,7 @@ function unregisterSocketEverywhere(socketId) {
     ids.delete(socketId);
     if (ids.size === 0) userSockets.delete(uid);
   }
+  socketUserId.delete(socketId);
 }
 
 // Called by POST /api/admin/users/:id/ban. Ends any match this user is
@@ -8464,7 +9026,9 @@ async function finalizePlayerLeftRoom(socketId, guard) {
       });
     }
   } finally {
-    persistPaidReplay(room, 'forfeit_or_disconnect');
+    // Preserve the last authoritative paid round for admin replay. Never await:
+    // replay storage must not participate in money settlement or room cleanup.
+    archivePaidReplayRoundDetached(room);
     // Only now is it safe to destroy the in-memory room.
     // MULTI-ROOM SAFETY: a socket may already have moved on to a newer room.
     // An old room must NEVER erase that newer socketRoom mapping.
@@ -8483,7 +9047,7 @@ async function finalizePlayerLeftRoom(socketId, guard) {
 // room to corrupt a newer room's socket mapping. Idempotent and room-scoped.
 function cleanupCompletedRoom(roomId, room) {
   if (!room || rooms.get(roomId) !== room) return;
-  persistPaidReplay(room, 'match_complete');
+  archivePaidReplayRoundDetached(room);
   clearRoomTurnTimer(room);
   for (const id of room.players || []) {
     if (socketRoom.get(id) === roomId) socketRoom.delete(id);
@@ -8738,8 +9302,6 @@ function armRoomTurnTimer(room) {
 }
 
 function startRound(room) {
-  // Archive the previous paid round before resetting room.log. Observation only.
-  try { archiveCurrentReplayRound(room); persistPaidReplay(room, 'round_boundary'); } catch (e) {}
   const round =
     dealRound();
 
@@ -8886,6 +9448,20 @@ io.on(
       ) => {
         try {
           console.log('[find_match] called, socket=' + socket.id + ' options=' + JSON.stringify({goal: options.goal, stake: options.stake, hasToken: !!options.token, name: options.name}));
+
+          // A banned account may not start a match either. forceDisconnectUser
+          // pulls them out once; nothing stopped them simply reconnecting and
+          // queuing again with the token they already had.
+          try {
+            const fmToken = verifyMatchToken(options.token);
+            if (fmToken && fmToken.id && await isUserBanned(fmToken.id)) {
+              console.log('[find_match] refused: account banned user=' + fmToken.id);
+              return emitMatchError(socket, 'account_banned');
+            }
+          } catch (e) {
+            // Never let this check itself stop an ordinary player.
+          }
+
           const goal =
             [
               100,
@@ -9043,6 +9619,11 @@ io.on(
                 );
 
           const playerInfo = {
+            // Public account id is included only so the matched opponent can
+            // send a friend request from the in-match UI. It does not touch
+            // room/turn/score/wallet state.
+            id: Number(userId),
+
             name:
               String(
                 options.name ||
@@ -9277,10 +9858,7 @@ io.on(
                 [],
 
               lastActivityAt:
-                Date.now(),
-
-              // Paid-only replay archive. Does not affect gameplay state.
-              replayRounds: []
+                Date.now()
             };
 
             rooms.set(
@@ -9551,7 +10129,17 @@ io.on(
 
     socket.on(
       'chat_message',
-      payload => {
+      async payload => {
+        // Banned players stay out of the match chat too.
+        try {
+          const uid = socketUserId.get(socket.id);
+          if (uid && await isUserBanned(uid)) {
+            return emitMatchError(socket, 'account_banned');
+          }
+        } catch (e) {
+          // A failed check must never silence an ordinary player.
+        }
+
         const roomId =
           socketRoom.get(
             socket.id
@@ -9640,6 +10228,13 @@ io.on(
               socket,
               'login_required'
             );
+          }
+
+          // A banned account may not talk. The token in this payload was
+          // signed before the ban and still verifies perfectly, so without
+          // this check a banned player keeps chatting until it expires.
+          if (await isUserBanned(tokenPayload.id)) {
+            return emitMatchError(socket, 'account_banned');
           }
 
           // Enforce the closed chat HERE, not just by hiding the input box.
@@ -10379,6 +10974,9 @@ io.on(
         // room can be dealt twice and each phone receives a different hand.
         if (room._nextRoundLockUntil && Date.now() < room._nextRoundLockUntil) return;
         room._nextRoundLockUntil = Date.now() + 5000;
+        // Replay is observation-only and fail-open: snapshot the completed paid round
+        // without awaiting it, so storage can never delay or freeze gameplay.
+        archivePaidReplayRoundDetached(room);
         startRound(room);
       }
     );
@@ -10512,7 +11110,7 @@ async function startServer() {
 
     await initPaidMatchTables();
 
-    await initPaidReplayTables();
+    await initPaidReplayTable();
 
     await initAdminUserTools();
 
@@ -10537,6 +11135,9 @@ async function startServer() {
     await initVisitTables();
 
     await initGlobalChatTable();
+
+    await initFriendTables();
+    await initFriendChatTable();
 
     await initTelegramJoinTable();
 
