@@ -1080,7 +1080,14 @@ app.get('/api/admin/replays/:matchId', adminOnly, async (req, res) => {
     res.json({ replay: result.rows[0] });
   } catch (e) {
     console.error('[paid_replay] admin detail error:', e.message);
-    res.status(500).json({ error:'server_error' });
+    // Temporary admin-only diagnostics: expose the database error to the
+    // authenticated admin so replay failures can be diagnosed without
+    // touching gameplay logic. Remove detail after the issue is fixed.
+    res.status(500).json({
+      error: 'server_error',
+      detail: String(e && e.message ? e.message : e),
+      code: e && e.code ? String(e.code) : null
+    });
   }
 });
 
