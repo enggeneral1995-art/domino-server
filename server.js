@@ -578,19 +578,39 @@ function validateEmail(rawEmail) {
    PASSWORD / AUTH
 ========================================================= */
 
-function hashPassword(password) {
+// scrypt is deliberately slow (that's what makes it resistant to
+// brute-forcing a stolen password hash), but Node's synchronous
+// crypto.scryptSync() runs that slowness ON THE MAIN THREAD -- while a
+// hash is being computed, the entire server is frozen: nobody's socket.io
+// ping/pong gets answered, no game_move goes through, nothing. With this
+// many concurrent players, logins/registrations happen constantly, and
+// each one used to stall EVERY active match at once for however long the
+// hash took (worse under load, worse the more concurrent users there
+// are) -- almost certainly what a burst of simultaneous "disconnected
+// mid-match" reports across unrelated players was actually catching.
+// crypto.scrypt (no Sync) does the same computation off the main thread
+// via libuv's threadpool, so the event loop -- and every other player's
+// live connection -- stays responsive while it runs.
+function scryptAsync(password, salt, keylen) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, keylen, (err, derivedKey) => {
+      if (err) reject(err); else resolve(derivedKey);
+    });
+  });
+}
+
+async function hashPassword(password) {
   const salt =
     crypto
       .randomBytes(16)
       .toString('hex');
 
   const derived =
-    crypto
-      .scryptSync(
-        password,
-        salt,
-        64
-      )
+    (await scryptAsync(
+      password,
+      salt,
+      64
+    ))
       .toString('hex');
 
   return (
@@ -600,7 +620,7 @@ function hashPassword(password) {
   );
 }
 
-function verifyPassword(
+async function verifyPassword(
   password,
   stored
 ) {
@@ -610,12 +630,11 @@ function verifyPassword(
         .split(':');
 
     const derived =
-      crypto
-        .scryptSync(
-          password,
-          salt,
-          64
-        )
+      (await scryptAsync(
+        password,
+        salt,
+        64
+      ))
         .toString('hex');
 
     const a =
@@ -888,7 +907,8 @@ async function initAdminUserTools() {
       balance_before NUMERIC(20,8) NOT NULL,
       balance_after NUMERIC(20,8) NOT NULL,
       reason TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      read_at TIMESTAMPTZ
     )
   `);
 
@@ -1015,7 +1035,7 @@ app.post(
           [
             email,
             phone || null,
-            hashPassword(
+            await hashPassword(
               password
             )
           ]
@@ -1149,10 +1169,10 @@ app.post(
         result.rows[0];
 
       if (
-        !verifyPassword(
+        !(await verifyPassword(
           password,
           user.password_hash
-        )
+        ))
       ) {
         return res
           .status(401)
@@ -1576,10 +1596,10 @@ app.post(
       const user = result.rows[0];
 
       if (
-        !verifyPassword(
+        !(await verifyPassword(
           currentPassword,
           user.password_hash
-        )
+        ))
       ) {
         return res
           .status(401)
@@ -1590,7 +1610,7 @@ app.post(
       }
 
       const newHash =
-        hashPassword(newPassword);
+        await hashPassword(newPassword);
 
       await db.query(
         `UPDATE users SET password_hash=$1 WHERE id=$2`,
@@ -1649,6 +1669,11 @@ async function initAppConfig() {
   `);
   await db.query(`
     ALTER TABLE app_config ADD COLUMN IF NOT EXISTS bot_difficulty TEXT NOT NULL DEFAULT 'hard'
+  `);
+  // Lets the admin close the public lobby chat without a redeploy.
+  // Defaults to open so an existing install behaves exactly as before.
+  await db.query(`
+    ALTER TABLE app_config ADD COLUMN IF NOT EXISTS chat_enabled BOOLEAN NOT NULL DEFAULT true
   `);
   await db.query(`
     INSERT INTO app_config (id, paid_enabled, online_baseline)
@@ -1739,6 +1764,303 @@ app.get('/api/global-chat/history', async (req, res) => {
     console.error('global-chat/history error:', e.message);
     res.status(500).json({ error: 'server_error' });
   }
+});
+
+/* =========================================================
+   ADMIN — GLOBAL CHAT MANAGEMENT
+   Admin panel can review recent public-chat messages and
+   delete a selected message. Deletion is broadcast live so
+   it disappears immediately for everyone currently online.
+========================================================= */
+
+app.get('/api/admin/global-chat/messages', adminOnly, async (_req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT id, user_id, name, text, created_at
+      FROM global_chat_messages
+      WHERE deleted = false
+      ORDER BY created_at DESC
+      LIMIT 300
+    `);
+
+    res.json({
+      messages: result.rows.map(row => ({
+        id: row.id,
+        userId: row.user_id,
+        name: row.name,
+        text: row.text,
+        ts: new Date(row.created_at).getTime()
+      }))
+    });
+  } catch (e) {
+    console.error('admin global-chat list error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/global-chat/:id/delete', adminOnly, async (req, res) => {
+  try {
+    const messageId = Number(req.params.id);
+    if (!Number.isInteger(messageId)) {
+      return res.status(400).json({ error: 'valid_message_id_required' });
+    }
+
+    const updated = await db.query(
+      `UPDATE global_chat_messages
+       SET deleted=true
+       WHERE id=$1 AND deleted=false
+       RETURNING id`,
+      [messageId]
+    );
+
+    if (!updated.rows.length) {
+      return res.status(404).json({ error: 'message_not_found' });
+    }
+
+    // Existing clients already listen for this event.
+    io.emit('global_chat_message_deleted', { id: messageId });
+    res.json({ ok: true, id: messageId });
+  } catch (e) {
+    console.error('admin global-chat delete error:', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+
+/* =========================================================
+   FRIEND SYSTEM — PHASE 1
+   Isolated from game rooms/matchmaking: search, requests, accept/reject,
+   friend list and remove only. No game engine state is touched here.
+========================================================= */
+async function initFriendTables() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS friendships (
+      id BIGSERIAL PRIMARY KEY,
+      user_low INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_high INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      requested_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT friendships_pair_unique UNIQUE (user_low, user_high),
+      CONSTRAINT friendships_no_self CHECK (user_low <> user_high),
+      CONSTRAINT friendships_status CHECK (status IN ('pending','accepted'))
+    )
+  `);
+  await db.query(`CREATE INDEX IF NOT EXISTS friendships_low_idx ON friendships(user_low, status)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friendships_high_idx ON friendships(user_high, status)`);
+}
+
+function friendPair(a, b) {
+  a = Number(a); b = Number(b);
+  return a < b ? [a,b] : [b,a];
+}
+
+app.get('/api/friends/search', auth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) return res.json({ users: [] });
+    const numericId = /^\d+$/.test(q) ? Number(q) : null;
+    const result = await db.query(`
+      SELECT id, username, avatar, photo_url
+      FROM users
+      WHERE id <> $1 AND banned = false
+        AND (($2::bigint IS NOT NULL AND id=$2) OR LOWER(COALESCE(username,'')) LIKE LOWER($3))
+      ORDER BY CASE WHEN $2::bigint IS NOT NULL AND id=$2 THEN 0 ELSE 1 END, username NULLS LAST
+      LIMIT 20
+    `, [req.user.id, numericId, '%' + q + '%']);
+    res.json({ users: result.rows.map(u => ({ id:Number(u.id), username:u.username || ('Player '+u.id), avatar:u.avatar||null, photo_url:u.photo_url||null })) });
+  } catch (e) {
+    console.error('friends search error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+app.get('/api/friends', auth, async (req, res) => {
+  try {
+    const uid = Number(req.user.id);
+    const result = await db.query(`
+      SELECT f.id AS friendship_id, f.status, f.requested_by,
+             u.id, u.username, u.avatar, u.photo_url
+      FROM friendships f
+      JOIN users u ON u.id = CASE WHEN f.user_low=$1 THEN f.user_high ELSE f.user_low END
+      WHERE (f.user_low=$1 OR f.user_high=$1)
+      ORDER BY f.updated_at DESC
+    `, [uid]);
+    const friends=[], incoming=[], outgoing=[];
+    for (const r of result.rows) {
+      const item={ friendship_id:Number(r.friendship_id), id:Number(r.id), username:r.username||('Player '+r.id), avatar:r.avatar||null, photo_url:r.photo_url||null };
+      if (r.status === 'accepted') friends.push(item);
+      else if (Number(r.requested_by) === uid) outgoing.push(item);
+      else incoming.push(item);
+    }
+    res.json({ friends, incoming, outgoing });
+  } catch (e) {
+    console.error('friends list error:', e.message);
+    res.status(500).json({ error:'server_error' });
+  }
+});
+
+app.post('/api/friends/request', auth, async (req, res) => {
+  try {
+    const me=Number(req.user.id), target=Number(req.body?.user_id);
+    if (!Number.isInteger(target) || target===me) return res.status(400).json({ error:'invalid_user' });
+    const exists=await db.query(`SELECT id FROM users WHERE id=$1 AND banned=false`,[target]);
+    if (!exists.rows.length) return res.status(404).json({ error:'user_not_found' });
+    const [lo,hi]=friendPair(me,target);
+    const prior=await db.query(`SELECT * FROM friendships WHERE user_low=$1 AND user_high=$2`,[lo,hi]);
+    if (prior.rows.length) {
+      const f=prior.rows[0];
+      if (f.status==='accepted') return res.status(409).json({ error:'already_friends' });
+      if (Number(f.requested_by)===me) return res.status(409).json({ error:'request_already_sent' });
+      // Crossed requests: accepting is friendlier and prevents duplicate pending rows.
+      await db.query(`UPDATE friendships SET status='accepted', updated_at=NOW() WHERE id=$1`,[f.id]);
+      return res.json({ ok:true, accepted:true });
+    }
+    await db.query(`INSERT INTO friendships(user_low,user_high,requested_by,status) VALUES($1,$2,$3,'pending')`,[lo,hi,me]);
+    res.json({ ok:true, sent:true });
+  } catch(e){ console.error('friend request error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:id/respond', auth, async (req,res) => {
+  try {
+    const fid=Number(req.params.id), action=String(req.body?.action||'');
+    if (!Number.isInteger(fid) || !['accept','reject'].includes(action)) return res.status(400).json({error:'invalid_request'});
+    const uid=Number(req.user.id);
+    const found=await db.query(`SELECT * FROM friendships WHERE id=$1 AND status='pending' AND (user_low=$2 OR user_high=$2)`,[fid,uid]);
+    if (!found.rows.length) return res.status(404).json({error:'request_not_found'});
+    if (Number(found.rows[0].requested_by)===uid) return res.status(403).json({error:'not_request_recipient'});
+    if (action==='accept') await db.query(`UPDATE friendships SET status='accepted', updated_at=NOW() WHERE id=$1`,[fid]);
+    else await db.query(`DELETE FROM friendships WHERE id=$1`,[fid]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend respond error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.delete('/api/friends/:id', auth, async (req,res) => {
+  try {
+    const fid=Number(req.params.id), uid=Number(req.user.id);
+    if (!Number.isInteger(fid)) return res.status(400).json({error:'invalid_request'});
+    await db.query(`DELETE FROM friendships WHERE id=$1 AND (user_low=$2 OR user_high=$2)`,[fid,uid]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend remove error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+/* =========================================================
+   FRIEND SYSTEM — PHASE 2
+   Presence + private 1:1 friend chat. Deliberately isolated from all
+   domino rooms, turns, scoring, matchmaking and wallet code.
+========================================================= */
+const friendPresence = new Map(); // userId -> last heartbeat ms
+
+async function initFriendChatTable() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS friend_messages (
+      id BIGSERIAL PRIMARY KEY,
+      sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await db.query(`ALTER TABLE friend_messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_pair_idx ON friend_messages(sender_id, recipient_id, id DESC)`);
+  await db.query(`CREATE INDEX IF NOT EXISTS friend_messages_recipient_idx ON friend_messages(recipient_id, id DESC)`);
+}
+
+async function areAcceptedFriends(a,b) {
+  const [lo,hi]=friendPair(a,b);
+  const r=await db.query(`SELECT 1 FROM friendships WHERE user_low=$1 AND user_high=$2 AND status='accepted' LIMIT 1`,[lo,hi]);
+  return !!r.rows.length;
+}
+
+app.post('/api/friends/presence', auth, async (req,res) => {
+  friendPresence.set(Number(req.user.id), Date.now());
+  res.json({ok:true});
+});
+
+app.get('/api/friends/presence', auth, async (req,res) => {
+  try {
+    const uid=Number(req.user.id), now=Date.now();
+    friendPresence.set(uid, now);
+    const r=await db.query(`SELECT CASE WHEN user_low=$1 THEN user_high ELSE user_low END AS id FROM friendships WHERE (user_low=$1 OR user_high=$1) AND status='accepted'`,[uid]);
+    const online={};
+    for(const row of r.rows){ const id=Number(row.id); online[id]=(now-(friendPresence.get(id)||0)) < 65000; }
+    res.json({online});
+  } catch(e){ console.error('friend presence error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.get('/api/friends/unread', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id);
+    const r=await db.query(`
+      SELECT sender_id AS id, COUNT(*)::int AS count, MAX(created_at) AS last_at
+      FROM friend_messages
+      WHERE recipient_id=$1 AND read_at IS NULL
+      GROUP BY sender_id
+    `,[me]);
+    const unread={};
+    for(const x of r.rows) unread[Number(x.id)]={count:Number(x.count)||0,lastTs:new Date(x.last_at).getTime()};
+    res.json({unread});
+  } catch(e){ console.error('friend unread error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:userId/read', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    await db.query(`UPDATE friend_messages SET read_at=NOW() WHERE sender_id=$1 AND recipient_id=$2 AND read_at IS NULL`,[other,me]);
+    res.json({ok:true});
+  } catch(e){ console.error('friend read error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.get('/api/friends/:userId/messages', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    const after=Math.max(0,Number(req.query.after)||0);
+    const r=await db.query(`
+      SELECT id, sender_id, recipient_id, text, created_at
+      FROM friend_messages
+      WHERE ((sender_id=$1 AND recipient_id=$2) OR (sender_id=$2 AND recipient_id=$1))
+        AND id > $3
+      ORDER BY id ASC LIMIT 100
+    `,[me,other,after]);
+    res.json({messages:r.rows.map(x=>({id:Number(x.id),sender_id:Number(x.sender_id),recipient_id:Number(x.recipient_id),text:x.text,ts:new Date(x.created_at).getTime()}))});
+  } catch(e){ console.error('friend messages error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+app.post('/api/friends/:userId/messages', auth, async (req,res) => {
+  try {
+    const me=Number(req.user.id), other=Number(req.params.userId);
+    if(!Number.isInteger(other) || !(await areAcceptedFriends(me,other))) return res.status(403).json({error:'not_friends'});
+    const text=censorText(String(req.body?.text||'').slice(0,500).trim());
+    if(!text) return res.status(400).json({error:'empty_message'});
+    const r=await db.query(`INSERT INTO friend_messages(sender_id,recipient_id,text) VALUES($1,$2,$3) RETURNING id,created_at`,[me,other,text]);
+    friendPresence.set(me,Date.now());
+    res.json({ok:true,message:{id:Number(r.rows[0].id),sender_id:me,recipient_id:other,text,ts:new Date(r.rows[0].created_at).getTime()}});
+  } catch(e){ console.error('friend send message error:',e.message); res.status(500).json({error:'server_error'}); }
+});
+
+/* Admin moderation — private friend chat review. Read-only by design. */
+app.get('/api/admin/friend-chat/messages', adminOnly, async (req,res) => {
+  try {
+    const limit=Math.min(500,Math.max(1,Number(req.query.limit)||300));
+    const r=await db.query(`
+      SELECT m.id, m.sender_id, m.recipient_id, m.text, m.created_at,
+             COALESCE(s.username, 'Player ' || m.sender_id::text) AS sender_name,
+             COALESCE(rc.username, 'Player ' || m.recipient_id::text) AS recipient_name
+      FROM friend_messages m
+      LEFT JOIN users s ON s.id=m.sender_id
+      LEFT JOIN users rc ON rc.id=m.recipient_id
+      ORDER BY m.id DESC
+      LIMIT $1
+    `,[limit]);
+    res.json({messages:r.rows.map(x=>({
+      id:Number(x.id), senderId:Number(x.sender_id), recipientId:Number(x.recipient_id),
+      senderName:x.sender_name, recipientName:x.recipient_name, text:x.text,
+      ts:new Date(x.created_at).getTime()
+    }))});
+  } catch(e){ console.error('admin friend chat error:',e.message); res.status(500).json({error:'server_error'}); }
 });
 
 /* =========================================================
@@ -1892,12 +2214,13 @@ async function isPaidEnabled() {
 app.get('/api/app-config', async (req, res) => {
   try {
     const cfg = await db.query(
-      `SELECT paid_enabled, online_baseline, paid_schedule_enabled, paid_open_time, paid_close_time, paid_timezone, bot_enabled, bot_difficulty
+      `SELECT paid_enabled, online_baseline, paid_schedule_enabled, paid_open_time, paid_close_time, paid_timezone, bot_enabled, bot_difficulty, chat_enabled
        FROM app_config WHERE id=1`
     );
     const row = cfg.rows[0] || {};
     res.json({
       paid_enabled: row.paid_enabled !== false,
+      chat_enabled: row.chat_enabled !== false,
       online_baseline: row.online_baseline != null ? Number(row.online_baseline) : 1000,
       paid_schedule_enabled: !!row.paid_schedule_enabled,
       paid_open_time: row.paid_open_time || '20:00',
@@ -1911,7 +2234,7 @@ app.get('/api/app-config', async (req, res) => {
       paid_live_now: await isPaidEnabled()
     });
   } catch (e) {
-    res.json({ paid_enabled: true, online_baseline: 1000, paid_schedule_enabled: false, paid_open_time: '20:00', paid_close_time: '00:00', paid_timezone: 'Asia/Baghdad', bot_enabled: false, bot_difficulty: 'hard', paid_live_now: true });
+    res.json({ paid_enabled: true, chat_enabled: true, online_baseline: 1000, paid_schedule_enabled: false, paid_open_time: '20:00', paid_close_time: '00:00', paid_timezone: 'Asia/Baghdad', bot_enabled: false, bot_difficulty: 'hard', paid_live_now: true });
   }
 });
 
@@ -1936,6 +2259,7 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
     const timezone = req.body?.paid_timezone;
     const botEnabled = req.body?.bot_enabled;
     const botDifficulty = req.body?.bot_difficulty;
+    const chatEnabled = req.body?.chat_enabled;
 
     const hasPaid = typeof paidEnabled === 'boolean';
     const hasBaseline = onlineBaseline !== undefined && onlineBaseline !== null;
@@ -1946,8 +2270,9 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
     const hasTimezone = typeof timezone === 'string' && timezone.trim() !== '';
     const hasBotEnabled = typeof botEnabled === 'boolean';
     const hasBotDifficulty = typeof botDifficulty === 'string' && botDifficulty.trim() !== '';
+    const hasChatEnabled = typeof chatEnabled === 'boolean';
 
-    if (!hasPaid && !hasBaseline && !hasSchedule && !hasOpenTime && !hasCloseTime && !hasTimezone && !hasBotEnabled && !hasBotDifficulty) {
+    if (!hasPaid && !hasBaseline && !hasSchedule && !hasOpenTime && !hasCloseTime && !hasTimezone && !hasBotEnabled && !hasBotDifficulty && !hasChatEnabled) {
       return res.status(400).json({ error: 'nothing_to_update' });
     }
     if (hasBaseline && (!Number.isInteger(onlineBaseline) || onlineBaseline < 0)) {
@@ -1979,6 +2304,7 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
           paid_timezone=COALESCE($6, paid_timezone),
           bot_enabled=COALESCE($7, bot_enabled),
           bot_difficulty=COALESCE($8, bot_difficulty),
+          chat_enabled=COALESCE($9, chat_enabled),
           updated_at=NOW()
       WHERE id=1
     `, [
@@ -1989,8 +2315,15 @@ app.post('/api/admin/app-config', adminOnly, async (req, res) => {
       hasCloseTime ? closeTime : null,
       hasTimezone ? timezone : null,
       hasBotEnabled ? botEnabled : null,
-      hasBotDifficulty ? botDifficulty.trim().toLowerCase() : null
+      hasBotDifficulty ? botDifficulty.trim().toLowerCase() : null,
+      hasChatEnabled ? chatEnabled : null
     ]);
+
+    // Tell everyone who is online right now, so the chat opens or closes
+    // immediately instead of only for people who reload afterwards.
+    if (hasChatEnabled) {
+      try { io.emit('chat_enabled_changed', { enabled: chatEnabled }); } catch (e) {}
+    }
 
     res.json({ ok: true });
   } catch (e) {
@@ -4249,6 +4582,22 @@ app.get(
   adminOnly,
   async (_req, res) => {
     try {
+      const totalsResult =
+        await db.query(
+          `
+          SELECT
+            COALESCE(SUM(amount), 0)::float8 AS total_volume,
+            COUNT(*) FILTER (
+              WHERE type='deposit' AND status IN ('pending','review')
+            )::int AS pending_deposits_count,
+            COUNT(*) FILTER (
+              WHERE type='withdraw' AND status='pending'
+            )::int AS pending_withdrawals_count
+          FROM wallet_transactions
+          `
+        );
+      const totals = totalsResult.rows[0] || {};
+
       const result =
         await db.query(
           `
@@ -4275,9 +4624,49 @@ app.get(
           `
         );
 
+      // The 200-row list above is a recent-activity feed, fine for a
+      // dashboard glance -- but a pending deposit or withdrawal is a task
+      // someone still has to act on, and it must never fall out of reach
+      // just because 200 newer transactions happened after it. Fetch
+      // every still-pending item separately (unbounded: there are only
+      // ever as many as haven't been resolved yet, which is small) and
+      // let the client merge them in.
+      const pendingResult =
+        await db.query(
+          `
+          SELECT
+            id,
+            user_id,
+            type,
+            network,
+            amount,
+            address,
+            tx_hash,
+            status,
+            fee,
+            created_at,
+            updated_at
+
+          FROM
+            wallet_transactions
+
+          WHERE
+            (type='deposit' AND status IN ('pending','review'))
+            OR (type='withdraw' AND status='pending')
+
+          ORDER BY
+            created_at DESC
+          `
+        );
+
       res.json({
+        total_volume: Number(totals.total_volume || 0),
+        pending_deposits_count: Number(totals.pending_deposits_count || 0),
+        pending_withdrawals_count: Number(totals.pending_withdrawals_count || 0),
         transactions:
-          result.rows
+          result.rows,
+        pending_transactions:
+          pendingResult.rows
       });
 
     } catch {
@@ -5246,13 +5635,6 @@ function tierAmountForRank(tiers, rank) {
 // Leaderboard = most WINS in settled FREE matches (stake=0) within the week.
 async function getLeaderboardForPeriod(periodStr, limit) {
   const { start, end } = weekBounds(periodStr);
-  // TOURNAMENT_MIN_MATCH_SECONDS: a real 1v1 game cannot be over in a few
-  // seconds. Two accounts can otherwise farm the free-play leaderboard by
-  // starting a match and having one side immediately quit/forfeit, over
-  // and over -- which is how a player racks up several "wins" in under a
-  // minute. Matches that settle faster than this simply don't count
-  // toward tournament standings (they still settle normally in every
-  // other respect).
   const result = await db.query(`
     SELECT u.id, u.email, x.wins
     FROM (
@@ -5261,14 +5643,13 @@ async function getLeaderboardForPeriod(periodStr, limit) {
       WHERE status='settled' AND stake=0
         AND winner_user_id IS NOT NULL
         AND settled_at >= $1 AND settled_at < $2
-        AND settled_at >= created_at + ($4 || ' seconds')::interval
       GROUP BY winner_user_id
     ) x
     JOIN users u ON u.id = x.user_id
     WHERE COALESCE(u.banned, false) = false
     ORDER BY x.wins DESC, u.id ASC
     LIMIT $3
-  `, [start, end, limit || 50, String(TOURNAMENT_MIN_MATCH_SECONDS)]);
+  `, [start, end, limit || 50]);
   return result.rows;
 }
 
@@ -5351,7 +5732,9 @@ async function checkStalledPaidMatches() {
       if (refunded) {
         for (const sid of room.players || []) {
           io.to(sid).emit('match_disputed', { match_id: room.matchId, auto_refunded: true, reason: 'server_detected_inactivity' });
-          socketRoom.delete(sid);
+          // MULTI-ROOM SAFETY: never let an OLD room delete a socket's
+          // mapping after that socket has already entered a newer room.
+          if (socketRoom.get(sid) === roomId) socketRoom.delete(sid);
         }
         rooms.delete(roomId);
       }
@@ -5458,30 +5841,41 @@ async function getDisplayLeaderboard(periodStr, limit, tiers) {
     getLeaderboardForPeriod(periodStr, Math.max(limit || 50, 200)),
     getFakeLeaderboardEntries()
   ]);
-  const combined = [
-    ...real.map((r, i) => ({
-      user_id: r.id,
-      email: r.email,
-      wins: Number(r.wins),
-      fake: false,
-      real_rank: i + 1, // rank among REAL competitors only — this is what actually gets paid
-      prize_amount: tierAmountForRank(tiers, i + 1)
-    })),
-    ...fake.map(f => ({
-      user_id: null,
-      fake_id: f.id,
-      display_name: f.display_name,
-      wins: f.wins,
-      fake: true,
-      real_rank: null,
-      prize_amount: 0
-    }))
-  ];
+  const realRows = real.map((r, i) => ({
+    user_id: r.id,
+    email: r.email,
+    wins: Number(r.wins),
+    fake: false,
+    real_rank: i + 1, // rank among REAL competitors only — this is what actually gets paid
+    prize_amount: tierAmountForRank(tiers, i + 1)
+  }));
+  // Every real winner is always shown, full stop -- a real free-play win
+  // must never be invisible just because the operator's cosmetic seeded
+  // (fake) rows have bigger, always-climbing numbers. On top of that,
+  // always reserve a minimum number of seeded slots too, regardless of
+  // how many real winners there are this week -- otherwise a week with
+  // more than `limit` real winners pushed every seeded row off the page
+  // (the whole point of the seeded rows -- keeping the page looking
+  // populated -- was defeated by having too MANY real winners).
+  const MIN_FAKE_SLOTS = 31;
+  const fakeSlots = Math.max(MIN_FAKE_SLOTS, (limit || 50) - realRows.length);
+  const fakeRows = fake.slice(0, fakeSlots).map(f => ({
+    user_id: null,
+    fake_id: f.id,
+    display_name: f.display_name,
+    wins: f.wins,
+    fake: true,
+    real_rank: null,
+    prize_amount: 0
+  }));
+  const combined = [...realRows, ...fakeRows];
   combined.sort((a, b) => b.wins - a.wins);
   // "rank" here is just the visual position in the mixed list (for display
   // order only) — real_rank is the one real users should ever see next to
   // their own name, since that's the number that determines their payout.
-  return combined.slice(0, limit || 50).map((row, i) => ({
+  // No further truncation: every real winner and the reserved fake slots
+  // above are already the exact set meant to be shown.
+  return combined.map((row, i) => ({
     ...row,
     rank: i + 1
   }));
@@ -6443,9 +6837,28 @@ async function settlePaidMatchIfAgreed(
       };
     }
 
+    // FREE matches (stake=0) only: don't wait for both sides to report.
+    // Requiring mutual agreement exists to stop one side unilaterally
+    // claiming a paid win -- a real anti-fraud need when money is on the
+    // line. For a free match there's nothing to defraud, and waiting for
+    // both reports is exactly what silently kept a completed free
+    // real-vs-real match out of the tournament leaderboard whenever the
+    // losing side's client never got to send its report (closed the app
+    // right after losing, network drop, etc.) -- the winner's own
+    // report_result had already arrived and said so. Infer the missing
+    // side from the one report that did arrive rather than waiting on a
+    // second one that may never come. Paid matches are untouched: this
+    // block only ever runs when stake is exactly 0.
+    let p1Report = match.p1_report;
+    let p2Report = match.p2_report;
+    if (Number(match.stake) === 0) {
+      if (p1Report && !p2Report) { p2Report = p1Report === 'win' ? 'loss' : 'win'; }
+      else if (p2Report && !p1Report) { p1Report = p2Report === 'win' ? 'loss' : 'win'; }
+    }
+
     if (
-      !match.p1_report ||
-      !match.p2_report
+      !p1Report ||
+      !p2Report
     ) {
       await client.query(
         'COMMIT'
@@ -6461,9 +6874,9 @@ async function settlePaidMatchIfAgreed(
       null;
 
     if (
-      match.p1_report ===
+      p1Report ===
         'win' &&
-      match.p2_report ===
+      p2Report ===
         'loss'
     ) {
       winnerUserId =
@@ -6473,9 +6886,9 @@ async function settlePaidMatchIfAgreed(
     }
 
     if (
-      match.p2_report ===
+      p2Report ===
         'win' &&
-      match.p1_report ===
+      p1Report ===
         'loss'
     ) {
       winnerUserId =
@@ -6979,6 +7392,11 @@ app.get('/api/admin/nowpayments-auth-test', async (req, res) => {
 app.get('/api/admin/users', adminOnly, async (req, res) => {
   try {
     const q = String(req.query.q || '').trim();
+    // FIX 2026-09-12: admin panel could only ever see the newest 500 users --
+    // this endpoint had no offset support at all, so "Load older users" (or
+    // any repeat request) just re-fetched the exact same top 500 rows every
+    // time. offset now actually moves the window back through the full table.
+    const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
     const params = [];
     let where = '';
     if (q) {
@@ -6989,6 +7407,14 @@ app.get('/api/admin/users', adminOnly, async (req, res) => {
                OR COALESCE(u.phone,'') ILIKE $1`;
     }
 
+    const totalCountResult = await db.query(`
+      SELECT COUNT(*)::int AS n
+      FROM users u
+      ${where}
+    `, params);
+    const totalCount = totalCountResult.rows[0] ? Number(totalCountResult.rows[0].n) : 0;
+
+    const pageParams = params.concat([offset]);
     const result = await db.query(`
       SELECT
         u.id, u.username, u.email, u.phone,
@@ -7010,9 +7436,14 @@ app.get('/api/admin/users', adminOnly, async (req, res) => {
       GROUP BY u.id
       ORDER BY u.id DESC
       LIMIT 500
-    `, params);
+      OFFSET $${pageParams.length}
+    `, pageParams);
 
-    res.json({ users: result.rows.map(u => ({
+    res.json({
+      total_count: totalCount,
+      offset,
+      returned_count: result.rows.length,
+      users: result.rows.map(u => ({
       ...u,
       balance: Number(u.balance || 0),
       wallet_locked: Number(u.wallet_locked || 0),
@@ -7242,6 +7673,15 @@ app.get(
   adminOnly,
   async (_req, res) => {
     try {
+      const totalCountResult =
+        await db.query(
+          `SELECT COUNT(*)::int AS n FROM paid_matches`
+        );
+      const totalCount =
+        totalCountResult.rows[0]
+          ? Number(totalCountResult.rows[0].n)
+          : 0;
+
       const result =
         await db.query(
           `
@@ -7264,6 +7704,7 @@ app.get(
         );
 
       res.json({
+        total_count: totalCount,
         matches:
           result.rows
       });
@@ -8047,7 +8488,19 @@ async function handlePlayerLeftRoom(socketId, opts) {
   // before we forfeit their match. Only for real tracked matches — an
   // untracked/free-floating room has nothing worth preserving.
   if (!immediate && hasTrackedMatch) {
-    const seatIdx = actualSeatIdx;
+    // Work out the seat HERE. This used to read `actualSeatIdx`, which is
+    // declared in finalizePlayerLeftRoom, not in this function -- so every
+    // disconnect threw a ReferenceError right here and the room was never
+    // parked. That is why a dropped player's resume was answered with
+    // "no_match_to_resume" and an empty parked list, and why they sat on
+    // "Connecting..." until the grace window expired and they lost.
+    const seatIdx = Array.isArray(room.players) ? room.players.indexOf(socketId) : -1;
+    if (seatIdx < 0) {
+      // The socket no longer owns a seat (already replaced by a reconnect):
+      // nothing to park, and nothing to forfeit.
+      socketRoom.delete(socketId);
+      return;
+    }
     const userId = room.userIds[seatIdx];
     const key = reconnectKey(roomId, userId);
 
@@ -8212,9 +8665,33 @@ async function finalizePlayerLeftRoom(socketId, guard) {
     }
   } finally {
     // Only now is it safe to destroy the in-memory room.
-    room.players.forEach(id => { socketRoom.delete(id); });
+    // MULTI-ROOM SAFETY: a socket may already have moved on to a newer room.
+    // An old room must NEVER erase that newer socketRoom mapping.
+    room.players.forEach(id => {
+      if (socketRoom.get(id) === roomId) socketRoom.delete(id);
+      try {
+        const liveSocket = io.sockets.sockets.get(id);
+        if (liveSocket) liveSocket.leave(roomId);
+      } catch (e) {}
+    });
     rooms.delete(roomId);
   }
+}
+
+// Destroy a room after a NORMAL completed match without allowing that old
+// room to corrupt a newer room's socket mapping. Idempotent and room-scoped.
+function cleanupCompletedRoom(roomId, room) {
+  if (!room || rooms.get(roomId) !== room) return;
+  clearRoomTurnTimer(room);
+  for (const id of room.players || []) {
+    if (socketRoom.get(id) === roomId) socketRoom.delete(id);
+    try {
+      const liveSocket = io.sockets.sockets.get(id);
+      if (liveSocket) liveSocket.leave(roomId);
+    } catch (e) {}
+  }
+  rooms.delete(roomId);
+  console.log('[room_cleanup] completed room removed safely roomId=' + roomId);
 }
 
 /* =========================================================
@@ -8317,6 +8794,48 @@ function tileFitsEnd(value, endValue) {
   const t = TILE_VALUES[value];
   return !!t && endValue != null && (t[0] === endValue || t[1] === endValue);
 }
+
+/* =========================================================
+   AUTHORITATIVE STATE BROADCAST
+
+   The old design sent only what CHANGED ("seat 1 played tile 12 on the
+   left") and let each phone maintain its own copy of the board. That works
+   right up until one message is lost, delayed, or applied twice -- after
+   which the two phones are playing different games, and every later move
+   makes it worse. It is exactly why a match against the bot (one copy of
+   the game) never glitched while a match against a person (three copies:
+   server + two phones) did.
+
+   These functions send the WHOLE position after every change instead. A
+   phone that missed ten messages is fixed by the next one, because the
+   next one is the complete truth rather than an increment on top of
+   whatever it happened to be holding. There is nothing left to fall out
+   of step with.
+
+   Each seat gets its own view: full detail on its own hand, only a count
+   for the opponent's, so the state can be sent freely without leaking the
+   opponent's tiles.
+========================================================= */
+
+function boardChainFor(room) {
+  // room.log holds the ordered moves; rebuild the visible chain from it so
+  // the phone never has to work out orientation for itself.
+  const chain = [];
+  for (const entry of (room.log || [])) {
+    if (!entry || entry.type !== 'move') continue;
+    chain.push({
+      value: entry.value,
+      side: entry.side,
+      rotation: entry.rotation,
+      seat: entry.seat
+    });
+  }
+  return chain;
+}
+
+// stateForSeat/broadcastState removed along with resume_match/game_state --
+// see /areas/yalla-domino.md. The client no longer listens for game_state,
+// so these would only have been dead sends.
 
 function hasLegalMove(room, seat) {
   const hand = room && room.hands && room.hands[seat];
@@ -8720,6 +9239,11 @@ io.on(
                 );
 
           const playerInfo = {
+            // Public account id is included only so the matched opponent can
+            // send a friend request from the in-match UI. It does not touch
+            // room/turn/score/wallet state.
+            id: Number(userId),
+
             name:
               String(
                 options.name ||
@@ -8741,6 +9265,26 @@ io.on(
             photo_url:
               photo_url
           };
+
+          // MULTI-ROOM SAFETY: one live socket can belong to only ONE active
+          // domino match. Previously a client could start matchmaking again while
+          // its previous room was still present in memory. socketRoom was then
+          // overwritten with the new room; when the OLD room later finalized or
+          // hit the stall-cleaner, it deleted that mapping and the new match began
+          // receiving `no_active_room` rejections. This is especially visible when
+          // several pairs are playing at the same time.
+          const existingRoomId = socketRoom.get(socket.id);
+          if (existingRoomId) {
+            const existingRoom = rooms.get(existingRoomId);
+            if (existingRoom && !existingRoom.finalizing) {
+              console.warn('[find_match] REJECTED already_in_match socket=' + socket.id +
+                ' existingRoom=' + existingRoomId);
+              return emitMatchError(socket, 'already_in_match', { room: existingRoomId });
+            }
+            // Stale mapping with no live room (or a room already finalizing).
+            if (socketRoom.get(socket.id) === existingRoomId) socketRoom.delete(socket.id);
+            try { socket.leave(existingRoomId); } catch (e) {}
+          }
 
           const key =
             queueKey(
@@ -8879,6 +9423,11 @@ io.on(
                     effectiveWaiting.userId,
                     userId
                   );
+                console.log(
+                  '[find_match] createFreeMatchRecord ok, roomId=' + roomId +
+                  ' matchId=' + (paidMatch && paidMatch.id) +
+                  ' p1=' + effectiveWaiting.userId + ' p2=' + userId
+                );
               } catch (e) {
                 console.error(
                   '[find_match] createFreeMatchRecord failed, roomId=' + roomId +
@@ -9291,6 +9840,18 @@ io.on(
             );
           }
 
+          // Enforce the closed chat HERE, not just by hiding the input box.
+          // Anyone can reopen a hidden box from a console; the only place a
+          // rule actually holds is the server.
+          try {
+            const chatCfg = await db.query('SELECT chat_enabled FROM app_config WHERE id=1');
+            if (chatCfg.rows.length && chatCfg.rows[0].chat_enabled === false) {
+              return emitMatchError(socket, 'chat_closed');
+            }
+          } catch (e) {
+            // A config read failure must not silence the chat.
+          }
+
           const rawText =
             (payload && typeof payload.text === 'string')
               ? payload.text
@@ -9456,7 +10017,15 @@ io.on(
           return;
         }
 
-        const seat = room.players[0] === socket.id ? 0 : 1;
+        // Resolve the seat by looking the socket UP, never by assuming
+        // "not seat 0 therefore seat 1". A stale socket that no longer owns
+        // a seat would otherwise be treated as seat 1 and could move on
+        // behalf of a player who is sitting there perfectly happily.
+        const seat = Array.isArray(room.players) ? room.players.indexOf(socket.id) : -1;
+        if (seat < 0) {
+          if (typeof ack === 'function') ack({ ok: false, error: 'not_in_room' });
+          return;
+        }
         const type = message && message.type;
         const value = Number(message && message.value);
 
@@ -9599,6 +10168,12 @@ io.on(
               return;
             }
             room._freeReported = socket.id;
+            console.log(
+              '[report_result] roomId=' + roomId +
+              ' userId=' + userId0 +
+              ' has NO matchId -- untracked path, only users.wins/losses updated, ' +
+              'this match will NOT appear in the tournament leaderboard'
+            );
 
             const didWin =
               !!(payload && payload.didWin);
@@ -9758,6 +10333,16 @@ io.on(
               room.matchId
             );
 
+          console.log(
+            '[report_result] matchId=' + room.matchId +
+            ' stake=' + room.stake +
+            ' seat=' + seat +
+            ' userId=' + userId +
+            ' report=' + report +
+            ' -> status=' + result.status +
+            (result.winnerUserId != null ? ' winnerUserId=' + result.winnerUserId : '')
+          );
+
           if (
             result.status ===
             'settled'
@@ -9822,6 +10407,14 @@ io.on(
             );
           }
 
+          // A settled/refunded match is finished. The old implementation left
+          // its room in memory indefinitely; the same sockets could then enter a
+          // new room while the old room still owned their ids. Later cleanup of
+          // the old room deleted the NEW mapping -> `no_active_room` mid-match.
+          if (result.status === 'settled' || result.status === 'disputed') {
+            cleanupCompletedRoom(roomId, room);
+          }
+
         } catch (e) {
           console.error(
             'report_result error:',
@@ -9839,6 +10432,124 @@ io.on(
     /* =====================================================
        NEXT ROUND
     ===================================================== */
+
+    // Round-end scoring needs the true pip total of BOTH hands, but each
+    // client only ever really knows its own -- the opponent's unplayed
+    // tiles are legitimately hidden from it, the same as in a real game.
+    // Both clients were each privately guessing the other's hand total
+    // from local placeholder tiles, so the two sides could show different,
+    // both-often-wrong point counts for the exact same round even though
+    // they still agreed on who won. The server already tracks both real
+    // hands (that's what move/draw legality checks use), so it can just
+    // answer the question directly instead of either side guessing.
+    socket.on(
+      'get_hand_totals',
+      (payload, ack) => {
+        try {
+          const roomId = socketRoom.get(socket.id);
+          const room = roomId ? rooms.get(roomId) : null;
+          if (!room || !Array.isArray(room.players)) {
+            if (typeof ack === 'function') ack({ ok: false });
+            return;
+          }
+          const seat = room.players.indexOf(socket.id);
+          if (seat < 0) {
+            if (typeof ack === 'function') ack({ ok: false });
+            return;
+          }
+          const opp = seat === 0 ? 1 : 0;
+          const pipSum = hand => (hand || []).reduce((s, v) => {
+            const t = TILE_VALUES[v];
+            return s + (t ? t[0] + t[1] : 0);
+          }, 0);
+          const myHand = (room.hands && room.hands[seat]) || [];
+          const oppHand = (room.hands && room.hands[opp]) || [];
+          if (typeof ack === 'function') {
+            const mine = pipSum(myHand);
+            const opponent = pipSum(oppHand);
+            // Authoritative round scoring.  The requesting phone always renders
+            // itself as local player 0 and its opponent as local player 1, so
+            // return the winner in that local orientation as well as the exact
+            // point delta.  This prevents the two phones from independently
+            // guessing hidden-hand values and drifting to different scores.
+            // Lowest remaining pip total wins a blocked round. For an exact
+            // tie there is no score delta; use a stable seat only for metadata
+            // so two callers can never nominate themselves as different winners.
+            const tied = mine === opponent;
+            const winnerSeat = tied ? 0 : (mine < opponent ? seat : opp);
+            const winnerLocal = winnerSeat === seat ? 0 : 1;
+            const points = tied ? 0 : Math.abs(opponent - mine);
+
+            // SCORE-SYNC-FINAL: the room owns the cumulative score. Commit a
+            // round exactly once by roundSerial, no matter which phone asks
+            // first or how many retries arrive. Each phone receives the same
+            // authoritative totals, translated to its local player-0 view.
+            if (!Array.isArray(room.scores)) room.scores = [0, 0];
+
+            // A round only has a score once it is actually finished.
+            //
+            // Without this, a phone that asks late -- after the other one
+            // has already triggered the next deal -- finds a new
+            // roundSerial, passes the commit-once check a second time, and
+            // scores the freshly dealt hands as though they were the end of
+            // a round.
+            const roundOver =
+              myHand.length === 0 ||
+              oppHand.length === 0 ||
+              ((room.boneyard || []).length === 0 &&
+               !hasLegalMove(room, seat) &&
+               !hasLegalMove(room, opp));
+
+            if (roundOver && room._scoreCommittedRound !== room.roundSerial) {
+              room.scores[winnerSeat] += points;
+              room._scoreCommittedRound = room.roundSerial;
+              room._scoreCommit = { winnerSeat, points };
+              console.log('[score_sync] room=' + roomId + ' round=' + room.roundSerial +
+                ' winnerSeat=' + winnerSeat + ' points=' + points +
+                ' scores=' + room.scores[0] + '-' + room.scores[1]);
+
+              // PUSH the new total to BOTH seats; do not wait to be asked.
+              //
+              // Scoring used to happen only in the reply to whoever called
+              // get_hand_totals, and on a blocked round a phone only calls it
+              // once it has decided for itself that both players are locked.
+              // The two phones do not always reach that conclusion -- one
+              // registers the opponent's final pass a moment later, or not at
+              // all -- so one phone asked, scored, and moved on while the
+              // other never asked and never learned the round had a score.
+              // That is the 6 on one screen and 0 on the other.
+              //
+              // The room owns the score, so the room tells both seats.
+              for (let s2 = 0; s2 < 2; s2++) {
+                const sid2 = room.players[s2];
+                if (!sid2) continue;
+                const o2 = s2 === 0 ? 1 : 0;
+                io.to(sid2).emit('round_score', {
+                  roundSerial: room.roundSerial,
+                  scores: [room.scores[s2] || 0, room.scores[o2] || 0],
+                  winnerLocal: winnerSeat === s2 ? 0 : 1,
+                  points
+                });
+              }
+            }
+            const committed = room._scoreCommit || { winnerSeat, points };
+            ack({
+              ok: true,
+              mine,
+              opponent,
+              myCount: myHand.length,
+              opponentCount: oppHand.length,
+              winnerLocal: committed.winnerSeat === seat ? 0 : 1,
+              points: committed.points,
+              scores: [room.scores[seat] || 0, room.scores[opp] || 0],
+              roundSerial: room.roundSerial || 0
+            });
+          }
+        } catch (e) {
+          if (typeof ack === 'function') ack({ ok: false });
+        }
+      }
+    );
 
     socket.on(
       'next_round',
@@ -9926,7 +10637,20 @@ io.on(
           }
         }
 
-        await handlePlayerLeftRoom(socket.id);
+        // Reverted to the original behavior: a real disconnect forfeits
+        // immediately, the same as a confirmed leave_match. The grace-window
+        // "park the seat and wait for resume_match" system below this call
+        // (pendingReconnects/RECONNECT_GRACE_MS) was added after the
+        // original version and is what introduced needsFullRebuild's forced
+        // full re-deal, the game_state reconciliation races, and the visible
+        // "board gets jumbled" symptom -- none of which existed before it.
+        // The original app had zero reported sync issues in real 2-player
+        // matches with exactly this instant-forfeit behavior, so this
+        // restores that instead of continuing to patch the system built on
+        // top of it. socket.io's own pingTimeout (45s) already absorbs a
+        // brief signal drop without ever firing 'disconnect' at all -- this
+        // only fires for a connection that's genuinely gone.
+        await handlePlayerLeftRoom(socket.id, { immediate: true });
         unregisterSocketEverywhere(socket.id);
       }
     );
@@ -9952,271 +10676,13 @@ io.on(
       }
     );
 
-    // Reclaim a seat in a match this user was dropped from, if we're still
-    // inside the grace window. This is what actually saves a match from a
-    // brief mobile signal drop: the client reconnects with a NEW socket id,
-    // and this swaps that new id into the parked room in place of the dead
-    // one, so play continues instead of the player being forfeited.
-    // A still-CONNECTED client can end up with a desynced board (e.g. its
-    // side-of-chain tracking got out of step somehow) without ever having
-    // actually disconnected -- so it can't use resume_match's replay path,
-    // which only exists for a genuine reconnect. This gives any connected
-    // player in an active room the SAME replay data (the whole current
-    // round's log, from the start) so their client can rebuild the board
-    // from scratch and be guaranteed correct, regardless of what state it
-    // was in before asking.
-    socket.on(
-      'request_board_sync',
-      (payload) => {
-        try {
-          const roomId = socketRoom.get(socket.id);
-          if (!roomId) { socket.emit('board_sync_result', { ok: false }); return; }
-          const room = rooms.get(roomId);
-          if (!room) { socket.emit('board_sync_result', { ok: false }); return; }
-          const seat = room.players[0] === socket.id ? 0 : 1;
-          socket.emit('board_sync_result', {
-            ok: true,
-            seat,
-            yourHand: room.hands[seat],
-            initialYourHand: room.initialHands ? room.initialHands[seat] : room.hands[seat],
-            initialOppHand: room.initialHands ? room.initialHands[seat === 0 ? 1 : 0] : [],
-            boneyardCount: room.boneyard.length,
-            initialBoneyardCount: room.initialBoneyardCount != null ? room.initialBoneyardCount : 14,
-            totalBoardMoves: (room.log || []).filter(e => e && e.type === 'move').length,
-            starterSeat: room.starterSeat,
-            turnSeat: room.turnSeat,
-            roundSerial: room.roundSerial,
-            leftEnd: room.leftEnd,
-            rightEnd: room.rightEnd,
-            turnDeadline: room.turnDeadline,
-            log: room.log || []
-          });
-        } catch (e) {
-          console.error('request_board_sync error:', e.message);
-          socket.emit('board_sync_result', { ok: false });
-        }
-      }
-    );
+    // request_game_state / request_board_sync / resume_match removed:
+    // reverted to the original design where a disconnect forfeits
+    // immediately (see the 'disconnect' handler above) and the client
+    // trusts incremental game_move/opponent_drew/draw_tile_result events
+    // directly, exactly as the original working version did. See
+    // /areas/yalla-domino.md for why.
 
-    socket.on(
-      'resume_match',
-      async (payload) => {
-        try {
-          const tokenPayload = verifyMatchToken(payload && payload.token);
-          if (!tokenPayload || !tokenPayload.id) {
-            socket.emit('resume_result', { ok: false, error: 'login_required' });
-            return;
-          }
-
-          const userId = tokenPayload.id;
-          registerUserSocket(userId, socket.id);
-
-          {
-            const banRow = await db.query(
-              `SELECT banned FROM users WHERE id=$1`, [userId]
-            );
-            if (banRow.rows.length && banRow.rows[0].banned) {
-              socket.emit('resume_result', { ok: false, error: 'account_banned' });
-              return;
-            }
-          }
-
-          // Find a parked room belonging to this user.
-          // Compare numerically: pending.userId comes from room.userIds
-          // (populated at match creation) while userId comes off the JWT.
-          // A strict === here silently misses the parked room whenever
-          // those two differ in type (number vs string), which leaves the
-          // player retrying resume every 1.5s until the grace window
-          // expires and they lose a match they never actually left.
-          let found = null;
-          for (const [key, pending] of pendingReconnects.entries()) {
-            if (Number(pending.userId) === Number(userId)) { found = { key, pending }; break; }
-          }
-
-          // A page reload can reconnect so quickly that the new socket asks
-          // to resume before Socket.IO has delivered the old socket's
-          // disconnect event and created pendingReconnects. Fall back to
-          // locating the user's still-active room by authenticated user id.
-          // This closes the reload race that used to dump a player to lobby.
-          if (!found) {
-            for (const [rid, activeRoom] of rooms.entries()) {
-              if (!activeRoom || !Array.isArray(activeRoom.userIds)) continue;
-              const seatIdx = activeRoom.userIds.findIndex(id => Number(id) === Number(userId));
-              if (seatIdx >= 0) {
-                found = {
-                  key: null,
-                  pending: {
-                    roomId: rid,
-                    seatIdx,
-                    userId,
-                    timer: null,
-                    logMark: 0,
-                    proactive: true
-                  }
-                };
-                break;
-              }
-            }
-          }
-
-          // Last resort: this socket may already be mapped to a room (the
-          // client asked to resume without ever having dropped, e.g. after
-          // a board-desync self-heal). Reclaiming its own live seat is
-          // always safe and beats refusing.
-          if (!found) {
-            const ownRoomId = socketRoom.get(socket.id);
-            const ownRoom = ownRoomId ? rooms.get(ownRoomId) : null;
-            if (ownRoom && Array.isArray(ownRoom.players)) {
-              const seatIdx = ownRoom.players.indexOf(socket.id);
-              if (seatIdx >= 0) {
-                found = {
-                  key: null,
-                  pending: {
-                    roomId: ownRoomId,
-                    seatIdx,
-                    userId,
-                    timer: null,
-                    logMark: 0,
-                    proactive: true
-                  }
-                };
-              }
-            }
-          }
-
-          if (!found) {
-            // Log enough to tell "the match genuinely ended" apart from
-            // "the match is alive but the lookup missed it" -- the latter
-            // is what strands a player on Connecting... until they lose.
-            const parkedUsers = Array.from(pendingReconnects.values()).map(p => p.userId);
-            const roomUserIds = Array.from(rooms.values())
-              .map(r => (r && Array.isArray(r.userIds)) ? r.userIds.join('/') : '-');
-            console.warn('[resume] no_match_to_resume userId=' + userId +
-              ' parkedUserIds=[' + parkedUsers.join(',') + ']' +
-              ' liveRooms=' + rooms.size +
-              ' liveRoomUserIds=[' + roomUserIds.join(' ') + ']');
-            socket.emit('resume_result', { ok: false, error: 'no_match_to_resume' });
-            return;
-          }
-
-          const key = found.key;
-          const pending = found.pending;
-          const room = rooms.get(pending.roomId);
-
-          if (!room) {
-            clearTimeout(pending.timer);
-            pendingReconnects.delete(key);
-            socket.emit('resume_result', { ok: false, error: 'match_gone' });
-            return;
-          }
-
-          // Stop the forfeit countdown and swap the new socket into the seat.
-          if (pending.timer) clearTimeout(pending.timer);
-          if (key != null) pendingReconnects.delete(key);
-
-          const oldSocketId = room.players[pending.seatIdx];
-          if (oldSocketId && oldSocketId !== socket.id) {
-            socketRoom.delete(oldSocketId);
-            const oldSock = io.sockets.sockets.get(oldSocketId);
-            if (oldSock) {
-              // Seat reclaim is a transport/session handoff, not an account
-              // logout. Silently retire the stale socket so the live page is
-              // not bounced out of the match by a force_disconnect handler.
-              try { oldSock.disconnect(true); } catch (e) {}
-            }
-          }
-          room.players[pending.seatIdx] = socket.id;
-          socketRoom.set(socket.id, pending.roomId);
-
-          const opponent = otherPlayer(room, socket.id);
-          if (opponent) {
-            io.to(opponent).emit('opponent_resumed', {
-              match_id: room.matchId
-            });
-          }
-
-          // Everything logged since this player dropped was necessarily
-          // played/drawn by the opponent (the disconnected player can't
-          // have moved) — replaying it through the client's existing
-          // applyRemoteMove/applyRemotePass/applyRemoteDraw handlers is
-          // exactly what it already does for a live move, just caught up
-          // all at once.
-          const missed =
-            room.log
-              ? room.log.slice(pending.logMark || 0)
-              : [];
-
-          console.log('[reconnect] resumed roomId=' + pending.roomId +
-            ' userId=' + userId + ' seat=' + pending.seatIdx +
-            ' newSocket=' + socket.id + ' missed=' + missed.length);
-
-          // A client resuming after a genuine soft reconnect (socket drop,
-          // page never reloaded) still has its game screen up and only
-          // needs the moves it missed. A client resuming after a full page
-          // reload has NOTHING on screen yet -- it needs the complete
-          // picture: everything online_start would have sent, plus the
-          // round's entire move log replayed from the very start, not just
-          // what happened since the last disconnect.
-          // Always rebuild from the authoritative round snapshot after a
-          // transport reconnect. Incremental replay assumes the pre-drop local
-          // board was already perfect; diagnostics showed that assumption can
-          // be false (local/server board-count mismatch). A deterministic full
-          // rebuild is safer and prevents compounding stale state.
-          const needsFullRebuild = true;
-
-          const opponentSeatIdx = pending.seatIdx === 0 ? 1 : 0;
-          const opponentUserId = room.userIds ? room.userIds[opponentSeatIdx] : null;
-          let opponentInfo = null;
-          if (needsFullRebuild && opponentUserId) {
-            try {
-              const oppRow = await db.query(
-                `SELECT username, avatar, photo_url FROM users WHERE id=$1`,
-                [opponentUserId]
-              );
-              if (oppRow.rows.length) {
-                opponentInfo = {
-                  name: oppRow.rows[0].username,
-                  avatar: oppRow.rows[0].avatar,
-                  photo_url: oppRow.rows[0].photo_url
-                };
-              }
-            } catch (e) {}
-          }
-
-          socket.emit('resume_result', {
-            ok: true,
-            match_id: room.matchId,
-            room_id: pending.roomId,
-            seat: pending.seatIdx,
-            needsFullRebuild,
-            goal: room.goal,
-            stake: room.stake,
-            prize: room.prize,
-            opponent: opponentInfo,
-            resync: {
-              yourHand: room.hands[pending.seatIdx].slice(),
-              initialYourHand: room.initialHands ? room.initialHands[pending.seatIdx] : room.hands[pending.seatIdx],
-              initialOppHand: room.initialHands ? room.initialHands[opponentSeatIdx] : [],
-              boneyardCount: room.boneyard.length,
-              initialBoneyardCount: room.initialBoneyardCount != null ? room.initialBoneyardCount : 14,
-              starterSeat: room.starterSeat,
-              turnSeat: room.turnSeat,
-              roundSerial: room.roundSerial,
-              leftEnd: room.leftEnd,
-              rightEnd: room.rightEnd,
-              turnDeadline: room.turnDeadline,
-              totalBoardMoves: (room.log || []).filter(e => e && e.type === 'move').length,
-              actions: (room.log || []).map(a => Object.assign({}, a)),
-              missed: needsFullRebuild ? [] : missed
-            }
-          });
-
-        } catch (e) {
-          console.error('resume_match error:', e.message);
-          socket.emit('resume_result', { ok: false, error: 'server_error' });
-        }
-      }
-    );
   }
 );
 
@@ -10267,6 +10733,9 @@ async function startServer() {
     await initVisitTables();
 
     await initGlobalChatTable();
+
+    await initFriendTables();
+    await initFriendChatTable();
 
     await initTelegramJoinTable();
 
