@@ -985,6 +985,20 @@ async function initPaidReplayTable() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  // Migration for databases created by an older replay build.
+  // CREATE TABLE IF NOT EXISTS does not add missing columns to an existing table.
+  // Keep this additive-only so it cannot affect paid-match/gameplay logic.
+  await db.query(`
+    ALTER TABLE paid_match_replays
+      ADD COLUMN IF NOT EXISTS room_id TEXT,
+      ADD COLUMN IF NOT EXISTS p1_user_id BIGINT,
+      ADD COLUMN IF NOT EXISTS p2_user_id BIGINT,
+      ADD COLUMN IF NOT EXISTS stake NUMERIC(20,8) NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS rounds JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
 }
 
 function paidReplaySnapshot(room) {
